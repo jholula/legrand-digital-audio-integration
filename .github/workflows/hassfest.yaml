@@ -14,3 +14,11 @@ jobs:
     steps:
       - uses: "actions/checkout@v3"
       - uses: home-assistant/actions/hassfest@master
+
+  validate-hacs:
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: HACS validation
+        uses: "hacs/action@main"
+        with:
+          category: "CHANGE_ME!"
