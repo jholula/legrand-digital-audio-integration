@@ -1,0 +1,12 @@
+{
+    "domain": "legrand_digital_audio",
+    "name": "Legrand Digital Audio",
+    "codeowners": ["@jholula"],
+    "config_flow": true,
+    "dependencies": [],
+    "documentation": "https://github.com/jholula/legrand-digital-audio-integration",
+    "iot_class": "local_polling",
+    "issue_tracker": "https://github.com/jholula/legrand-digital-audio-integration/issues",
+    "requirements": ["sockets","asyncio"],
+    "version": "1.0.0"
+}
