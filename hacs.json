@@ -1,0 +1,8 @@
+{
+    "name": "Legrand Digital Audio",
+    "content_in_root": false,
+    "render_readme": true,
+    "domains": ["media_player"],
+    "homeassistant": "2023.8.0",
+    "iot_class": "local_polling"
+}
