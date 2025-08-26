@@ -1,7 +1,10 @@
 {
     "domain": "legrand_digital_audio",
     "name": "Legrand Digital Audio",
-    "version": "1.0",
+    "version": "1.0.0",
     "requirements": ["sockets","asyncio"],
-    "codeowners": ["jholula"]
+    "dependencies": [],
+    "codeowners": ["@jholula"],
+    "documentation": "",
+    "config_flow": true
   }
