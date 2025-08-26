@@ -9,7 +9,7 @@ on:
           - main
 
 jobs:
-  validate:
+  validate-haos:
     runs-on: "ubuntu-latest"
     steps:
       - uses: "actions/checkout@v3"
@@ -21,4 +21,4 @@ jobs:
       - name: HACS validation
         uses: "hacs/action@main"
         with:
-          category: "CHANGE_ME!"
+          category: "integration"
