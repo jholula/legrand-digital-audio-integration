@@ -42,11 +42,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error(f"Failed to connect to {host}:{port}: {e}")
         return False
 
-    # Store the shared socket and zones in Home Assistant's data dictionary
+    # Store the shared socket and zones in Home Assistant's data dictionary.
+    # `entities` is populated by the media_player platform during setup so that
+    # any entity (notably the aggregate "all" entity) can look up its peers and
+    # trigger immediate state refreshes after issuing commands.
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         "socket": shared_socket,
         "zones": zones,
+        "entities": {},
     }
 
     # Forward the entry to the media_player platform
