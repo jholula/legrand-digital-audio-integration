@@ -17,7 +17,6 @@ SCAN_INTERVAL = timedelta(seconds=10)
 SOCKET_TIMEOUT = 10
 
 ALL_KEY = "all"
-ALL_FRIENDLY_NAME = "legrand_audio_zone_all"
 
 
 async def async_setup_entry(hass, config, async_add_entities) -> None:
@@ -51,7 +50,7 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
     # (config_flow assigns the same SourceList to every zone today).
     aggregate_sources = zones[0]["sources"] if zones else []
     aggregate = LegrandDigitalAudio(
-        ALL_FRIENDLY_NAME,
+        ALL_KEY,
         shared_socket,
         zone_ids,
         aggregate_sources,
