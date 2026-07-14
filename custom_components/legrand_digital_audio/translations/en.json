@@ -1,0 +1,31 @@
+{
+    "config": {
+        "flow_title": "Legrand Digital Audio ({host})",
+        "step": {
+            "user": {
+                "title": "Legrand Digital Audio",
+                "description": "Select a device discovered on your network, or choose manual entry. Port 2112 is used automatically.",
+                "data": {
+                    "host": "Device"
+                }
+            },
+            "manual": {
+                "title": "Legrand Digital Audio",
+                "description": "Enter the IP address of your Legrand Digital Audio distribution module (AU7000). Port 2112 is used automatically.",
+                "data": {
+                    "host": "IP address"
+                }
+            },
+            "discovery_confirm": {
+                "title": "Legrand Digital Audio",
+                "description": "A Legrand Digital Audio device was found at {host}. Do you want to add it?"
+            }
+        },
+        "error": {
+            "cannot_connect": "Failed to connect. Make sure the device is reachable on port 2112."
+        },
+        "abort": {
+            "already_configured": "This device is already configured."
+        }
+    }
+}
