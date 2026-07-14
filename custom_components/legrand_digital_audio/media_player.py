@@ -1,6 +1,5 @@
 import json
 import logging
-import asyncio
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -14,16 +13,15 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(seconds=10)
-SOCKET_TIMEOUT = 10
 
 ALL_KEY = "all"
 
 
 async def async_setup_entry(hass, config, async_add_entities) -> None:
     """Set up the Legrand Digital Audio platform."""
-    _LOGGER.debug(hass.data[DOMAIN][config.entry_id])
+    _LOGGER.debug("Setting up media_player entities for entry %s", config.entry_id)
     entry_data = hass.data[DOMAIN][config.entry_id]
-    shared_socket = entry_data["socket"]
+    connection = entry_data["connection"]
     zones = entry_data["zones"]
     entities_registry = entry_data["entities"]
 
@@ -36,12 +34,12 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
         sources = zone.get("sources")
 
         if not name or not zone_id:
-            _LOGGER.error(f"Invalid zone configuration: {zone}")
+            _LOGGER.error("Invalid zone configuration: %s", zone)
             continue
 
         zone_ids.append(f"{zone_id}")
         entity = LegrandDigitalAudio(
-            name, shared_socket, zone_id, sources, entities_registry, config.entry_id
+            name, connection, zone_id, sources, entities_registry, config.entry_id
         )
         entities_registry[zone_id] = entity
         entities.append(entity)
@@ -51,7 +49,7 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
     aggregate_sources = zones[0]["sources"] if zones else []
     aggregate = LegrandDigitalAudio(
         ALL_KEY,
-        shared_socket,
+        connection,
         zone_ids,
         aggregate_sources,
         entities_registry,
@@ -69,7 +67,7 @@ class LegrandDigitalAudio(MediaPlayerEntity):
     def __init__(
         self,
         name,
-        shared_socket,
+        connection,
         zone_id,
         sources,
         entities_registry,
@@ -77,14 +75,13 @@ class LegrandDigitalAudio(MediaPlayerEntity):
     ):
         """Initialize the media player."""
         self._name = f"{name}"
-        self._socket = shared_socket
+        self._connection = connection
         self._zone_id = zone_id
         self._state = MediaPlayerState.OFF
         self._volume = 0.05
         self._source = sources[0]["Name"] if sources else None
         self._source_list = sources or []
         self._is_muted = False
-        self._lock = asyncio.Lock()
         self._entities_registry = entities_registry
         self._is_aggregate = isinstance(zone_id, list)
 
@@ -108,60 +105,12 @@ class LegrandDigitalAudio(MediaPlayerEntity):
         return self._command_id
 
     async def _send_command(self, command):
-        """Send a command to the device and wait for the response."""
-        async with self._lock:
-            try:
-                command_data = json.loads(command)
-                sent_command_id = command_data.get("ID")
+        """Send a command to the device via the shared connection.
 
-                _LOGGER.debug(f"Sent: {command}")
-                await asyncio.get_event_loop().sock_sendall(
-                    self._socket, str(command + "\n").encode("utf-8")
-                )
-
-                try:
-                    return await asyncio.wait_for(
-                        self._read_response(sent_command_id),
-                        timeout=SOCKET_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    # Without this guard a missed reply would hold the shared
-                    # lock forever and freeze every other entity's update.
-                    _LOGGER.warning(
-                        f"Timeout waiting for response to command ID {sent_command_id}"
-                    )
-                    return None
-            except Exception as e:
-                _LOGGER.error(f"Socket communication error: {e}")
-                return None
-
-    async def _read_response(self, sent_command_id):
-        """Read framed JSON messages from the socket until ours arrives."""
-        buffer = ""
-        while True:
-            data = await asyncio.get_event_loop().sock_recv(self._socket, 1024)
-            if not data:
-                _LOGGER.error("Socket connection closed by the device.")
-                return None
-
-            buffer += data.decode("utf-8")
-            messages = buffer.split("\x00")
-            buffer = messages.pop()
-
-            for message in messages:
-                try:
-                    response_json = json.loads(message)
-                    _LOGGER.debug(f"Received: {response_json}")
-
-                    response_id = response_json.get("ID")
-                    if response_id == sent_command_id:
-                        return response_json
-                    else:
-                        _LOGGER.warning(
-                            f"Response ID {response_id} does not match sent ID {sent_command_id}. Ignoring."
-                        )
-                except json.JSONDecodeError:
-                    _LOGGER.error(f"Failed to parse JSON: {message}")
+        All socket I/O, framing, reconnection and the greeting handshake are
+        handled by the connection manager; this is a thin passthrough.
+        """
+        return await self._connection.send(command)
 
     def _parse_response(self, response):
         """Parse the response from the device and update the state."""
@@ -181,7 +130,7 @@ class LegrandDigitalAudio(MediaPlayerEntity):
                         self._source = obj.get("Name")
                 self._is_muted = properties.get("Muted", self._is_muted)
         except Exception as e:
-            _LOGGER.error(f"Failed to parse response: {e}")
+            _LOGGER.error("Failed to parse response: %s", e)
 
     async def async_update(self):
         """Fetch the latest state from the device."""
@@ -221,7 +170,7 @@ class LegrandDigitalAudio(MediaPlayerEntity):
             try:
                 await peer.async_update()
             except Exception as e:
-                _LOGGER.warning(f"Aggregate update: peer refresh failed: {e}")
+                _LOGGER.warning("Aggregate update: peer refresh failed: %s", e)
 
         any_on = any(p._state == MediaPlayerState.ON for p in peers)
         self._state = MediaPlayerState.ON if any_on else MediaPlayerState.OFF
@@ -247,6 +196,11 @@ class LegrandDigitalAudio(MediaPlayerEntity):
             aggregate = self._entities_registry.get(ALL_KEY)
             if aggregate is not None:
                 aggregate.async_schedule_update_ha_state(force_refresh=True)
+
+    @property
+    def available(self):
+        """Return True when the shared connection to the device is up."""
+        return self._connection.available
 
     @property
     def unique_id(self):

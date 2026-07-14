@@ -1,18 +1,19 @@
 import logging
-import asyncio
-import socket
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.typing import ConfigType
-from .const import DOMAIN, SOCKET_TIMEOUT
 from homeassistant.const import Platform
+
+from .const import DOMAIN, DEFAULT_PORT
+from .connection import LegrandConnection
 
 PLATFORMS = [Platform.MEDIA_PLAYER]
 _LOGGER = logging.getLogger(__name__)
 
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the integration using YAML (if applicable)."""
-    # This is only needed if you want to support YAML configuration
     hass.data.setdefault(DOMAIN, {})
     return True
 
@@ -21,59 +22,57 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up the integration from a config entry."""
     _LOGGER.info("Setting up Legrand Digital Audio from config entry")
 
-    # Retrieve configuration data from the entry
     host = entry.data["host"]
-    port = entry.data["port"]
-    zones = entry.data["zones"]  # Retrieve zones from the config entry
+    port = entry.data.get("port", DEFAULT_PORT)
+    zones = entry.data["zones"]
 
     if not host or not port:
         _LOGGER.error("Host or port not provided in configuration entry")
         return False
 
-    _LOGGER.info(f"Setting up {len(zones)} Legrand Digital Media zones on {host}:{port}")
+    _LOGGER.info(
+        "Setting up %s Legrand Digital Audio zones on %s:%s",
+        len(zones),
+        host,
+        port,
+    )
 
-    # Create a shared socket connection
+    # Establish the shared connection (handshake included). If the device is
+    # unreachable at startup, tell HA to retry setup later instead of failing.
+    connection = LegrandConnection(host, port)
     try:
-        shared_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        shared_socket.settimeout(SOCKET_TIMEOUT)
-        await asyncio.get_event_loop().sock_connect(shared_socket, (host, port))
-        _LOGGER.info(f"Connected to {host}:{port}")
-    except Exception as e:
-        _LOGGER.error(f"Failed to connect to {host}:{port}: {e}")
-        return False
+        await connection.async_connect()
+    except Exception as e:  # noqa: BLE001
+        raise ConfigEntryNotReady(
+            f"Unable to connect to Legrand Digital Audio at {host}:{port}: {e}"
+        ) from e
 
-    # Store the shared socket and zones in Home Assistant's data dictionary.
     # `entities` is populated by the media_player platform during setup so that
     # any entity (notably the aggregate "all" entity) can look up its peers and
     # trigger immediate state refreshes after issuing commands.
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
-        "socket": shared_socket,
+        "connection": connection,
         "zones": zones,
         "entities": {},
     }
 
-    # Forward the entry to the media_player platform
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.info("Unloading Legrand Digital Audio config entry")
 
-    # Close the shared socket connection
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
     entry_data = hass.data[DOMAIN].pop(entry.entry_id, None)
-    if entry_data and "socket" in entry_data:
+    if entry_data and "connection" in entry_data:
         try:
-            entry_data["socket"].close()
-            _LOGGER.info("Closed socket connection")
-        except Exception as e:
-            _LOGGER.error(f"Error closing socket: {e}")
+            await entry_data["connection"].async_close()
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.error("Error closing connection: %s", e)
 
-    # Unload the media_player platform
-    await hass.config_entries.async_forward_entry_unload(entry, PLATFORMS)
-
-    return True
+    return unload_ok
