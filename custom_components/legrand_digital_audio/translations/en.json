@@ -11,9 +11,10 @@
             },
             "manual": {
                 "title": "Legrand Digital Audio",
-                "description": "Enter the IP address of your Legrand Digital Audio distribution module (AU7000). Port 2112 is used automatically.",
+                "description": "Enter the IP address of your Legrand Digital Audio distribution module (AU7000). The port is 2112 on known hardware; only change it if your device uses a different control port.",
                 "data": {
-                    "host": "IP address"
+                    "host": "IP address",
+                    "port": "Port"
                 }
             },
             "discovery_confirm": {

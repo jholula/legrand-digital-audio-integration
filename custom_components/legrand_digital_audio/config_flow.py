@@ -96,21 +96,31 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # Manual entry fallback (host only; port is fixed at 2112).
     # ------------------------------------------------------------------
     async def async_step_manual(self, user_input=None):
-        """Handle manual IP entry."""
+        """Handle manual IP entry.
+
+        The port defaults to 2112 (the only value seen in the wild) but is
+        left editable in case other hardware uses a different control port.
+        """
         errors = {}
         if user_input is not None:
             host = user_input["host"]
+            port = user_input["port"]
             try:
                 self._zones = await self.hass.async_add_executor_job(
-                    self._fetch_zones, host, DEFAULT_PORT
+                    self._fetch_zones, host, port
                 )
             except Exception as e:  # noqa: BLE001
                 _LOGGER.error("Error fetching devices from %s: %s", host, e)
                 errors["base"] = "cannot_connect"
             else:
-                return await self._create_entry(host)
+                return await self._create_entry(host, port)
 
-        schema = vol.Schema({vol.Required("host"): str})
+        schema = vol.Schema(
+            {
+                vol.Required("host"): str,
+                vol.Required("port", default=DEFAULT_PORT): int,
+            }
+        )
         return self.async_show_form(
             step_id="manual", data_schema=schema, errors=errors
         )
@@ -162,7 +172,7 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    async def _create_entry(self, host):
+    async def _create_entry(self, host, port=DEFAULT_PORT):
         """Set a stable unique id (from MAC when resolvable) and create entry."""
         mac = await self.hass.async_add_executor_job(self._get_mac, host)
         if mac:
@@ -176,7 +186,7 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             title="Legrand Digital Audio",
             data={
                 "host": host,
-                "port": DEFAULT_PORT,
+                "port": port,
                 "zones": self._zones,
             },
         )
