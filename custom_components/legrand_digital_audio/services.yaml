@@ -1,0 +1,11 @@
+attempt_bind:
+  name: Attempt bind
+  description: >-
+    Starts the software half of AU7001 bind (Zone SystemCreate), matching the
+    Digital Audio app. After calling this, press the physical bind button on
+    the AU7001 until the LED is solid white. Check bind_status / bind_hint on
+    the media player entity for progress.
+  target:
+    entity:
+      domain: media_player
+      integration: legrand_digital_audio

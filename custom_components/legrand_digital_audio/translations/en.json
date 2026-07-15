@@ -1,0 +1,64 @@
+{
+    "config": {
+        "flow_title": "Legrand Digital Audio ({host})",
+        "step": {
+            "user": {
+                "title": "Legrand Digital Audio",
+                "description": "Choose which Legrand device to add. Found {au7000_count} distribution module(s) (AU7000) and {au7001_count} streaming module(s) (AU7001) on your network.\n\n**AU7000** controls whole-house zones (power, volume, sources).\n\n**AU7001** controls streaming (Pandora browse, Music Assistant). Requires bind in the Digital Audio app (solid white LED on the module).",
+                "data": {
+                    "device": "Device"
+                }
+            },
+            "manual": {
+                "title": "AU7000 — manual setup",
+                "description": "Enter the IP address of your **distribution module (AU7000)**. This is the unit that drives your speaker zones. Port **2112** is used on all known hardware.",
+                "data": {
+                    "host": "IP address",
+                    "port": "Port"
+                }
+            },
+            "manual_au7001": {
+                "title": "AU7001 — manual setup",
+                "description": "Enter the IP address of your **streaming module (AU7001)**. The integration will locate it via UPnP/SSDP on that address.\n\nMake sure the module is bound in the Digital Audio app first (bind button + **solid white LED**).",
+                "data": {
+                    "host": "IP address"
+                }
+            },
+            "discovery_confirm": {
+                "title": "Add distribution module (AU7000)",
+                "description": "Add the Legrand distribution module at **{host}**?\n\nThis creates media player entities for each whole-house zone (power, volume, source selection)."
+            },
+            "ssdp_confirm": {
+                "title": "Add streaming module (AU7001)",
+                "description": "Add **{device_name}** as a streaming media player? (Discovered on the network as *{name}*.)\n\n**Before using streaming:**\n1. Open the Digital Audio app → Settings → **Bind Digital Source** and press the bind button on the AU7001 until the LED is **solid white**.\n2. Or use the **Start bind** button on this device in Home Assistant, then press the AU7001 bind button.\n3. Sign in to Pandora/Spotify in the app if you want those services.\n\n**Music Assistant:** After setup, go to Music Assistant → Settings → Player providers → enable **Home Assistant**, then add this entity as a player. The AU7001 must stay bound (Active) for playback to work."
+            },
+            "recommend_companion": {
+                "title": "Add companion device?",
+                "description": "We also found **{companion_label}** on your network.\n\nMost installs use **both** modules: the AU7000 for zone control and the AU7001 for streaming. Add the companion device now?",
+                "data": {
+                    "add_companion": "Add companion device"
+                }
+            }
+        },
+        "error": {
+            "cannot_connect": "Could not connect to the AU7000 on port 2112. Check the IP address and that the module is powered on.",
+            "cannot_connect_au7001": "Could not find an AU7001 at that IP. Make sure it is powered on and bound (solid white LED)."
+        },
+        "abort": {
+            "already_configured": "This device is already configured."
+        }
+    },
+    "services": {
+        "attempt_bind": {
+            "name": "Attempt bind",
+            "description": "Starts the software half of AU7001 bind (SystemCreate). Then press the physical bind button on the AU7001 until the LED is solid white."
+        }
+    },
+    "entity": {
+        "button": {
+            "start_bind": {
+                "name": "Start bind"
+            }
+        }
+    }
+}
