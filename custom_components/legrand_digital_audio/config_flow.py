@@ -3,7 +3,13 @@ from __future__ import annotations
 from homeassistant import config_entries
 from homeassistant.helpers.device_registry import format_mac
 import voluptuous as vol
-from .const import DOMAIN, DEFAULT_PORT
+from .const import (
+    CONF_DEVICE_TYPE,
+    DEFAULT_PORT,
+    DEVICE_TYPE_AU7000,
+    DEVICE_TYPE_AU7001,
+    DOMAIN,
+)
 import logging
 import socket
 import json
@@ -31,6 +37,10 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._discovered_hosts: list[str] = []
         self._host: str | None = None
         self._zones: list | None = None
+        # AU7001 (UPnP) discovery context.
+        self._ssdp_location: str | None = None
+        self._ssdp_udn: str | None = None
+        self._ssdp_name: str | None = None
 
     # ------------------------------------------------------------------
     # User-initiated flow: actively scan the LAN, then let the user pick.
@@ -157,6 +167,7 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(
                     title="Legrand Digital Audio",
                     data={
+                        CONF_DEVICE_TYPE: DEVICE_TYPE_AU7000,
                         "host": self._host,
                         "port": DEFAULT_PORT,
                         "zones": self._zones,
@@ -167,6 +178,46 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="discovery_confirm",
             description_placeholders={"host": self._host},
             errors=errors,
+        )
+
+    # ------------------------------------------------------------------
+    # SSDP discovery: the AU7001 streaming module advertises over UPnP.
+    # ------------------------------------------------------------------
+    async def async_step_ssdp(self, discovery_info):
+        """Handle discovery of an AU7001 (NuVo Zone) via SSDP."""
+        location = getattr(discovery_info, "ssdp_location", None)
+        upnp = getattr(discovery_info, "upnp", {}) or {}
+        udn = upnp.get("UDN")
+        friendly = upnp.get("friendlyName") or "Legrand AU7001"
+
+        if not location or not udn:
+            return self.async_abort(reason="cannot_connect")
+
+        await self.async_set_unique_id(udn)
+        self._abort_if_unique_id_configured(updates={"location": location})
+
+        self._ssdp_location = location
+        self._ssdp_udn = udn
+        self._ssdp_name = friendly
+        self.context["title_placeholders"] = {"host": friendly}
+        return await self.async_step_ssdp_confirm()
+
+    async def async_step_ssdp_confirm(self, user_input=None):
+        """Confirm adding a discovered AU7001 streaming zone."""
+        if user_input is not None:
+            return self.async_create_entry(
+                title=self._ssdp_name,
+                data={
+                    CONF_DEVICE_TYPE: DEVICE_TYPE_AU7001,
+                    "location": self._ssdp_location,
+                    "udn": self._ssdp_udn,
+                    "name": self._ssdp_name,
+                },
+            )
+
+        return self.async_show_form(
+            step_id="ssdp_confirm",
+            description_placeholders={"name": self._ssdp_name},
         )
 
     # ------------------------------------------------------------------
@@ -185,6 +236,7 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title="Legrand Digital Audio",
             data={
+                CONF_DEVICE_TYPE: DEVICE_TYPE_AU7000,
                 "host": host,
                 "port": port,
                 "zones": self._zones,

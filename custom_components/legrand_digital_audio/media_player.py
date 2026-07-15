@@ -2,13 +2,24 @@ import json
 import logging
 
 from homeassistant.components.media_player import (
+    BrowseError,
+    BrowseMedia,
+    MediaClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
+    MediaType,
 )
+from homeassistant.helpers.entity import DeviceInfo
 
 from datetime import timedelta
-from .const import DOMAIN
+from .const import (
+    CONF_DEVICE_TYPE,
+    DEVICE_TYPE_AU7000,
+    DEVICE_TYPE_AU7001,
+    DOMAIN,
+    NUVO_BROWSE_ROOT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +32,11 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
     """Set up the Legrand Digital Audio platform."""
     _LOGGER.debug("Setting up media_player entities for entry %s", config.entry_id)
     entry_data = hass.data[DOMAIN][config.entry_id]
+
+    if entry_data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_AU7001:
+        async_add_entities([LegrandNuvoZone(entry_data["upnp"], config.entry_id)])
+        return
+
     connection = entry_data["connection"]
     zones = entry_data["zones"]
     entities_registry = entry_data["entities"]
@@ -333,3 +349,189 @@ class LegrandDigitalAudio(MediaPlayerEntity):
                 self.async_write_ha_state()
                 self._refresh_peers()
                 return
+
+
+class LegrandNuvoZone(MediaPlayerEntity):
+    """An AU7001 streaming zone controlled over UPnP.
+
+    Modeled as its own device/media_player (separate from the AU7000 zones):
+    a target you can stream services like Pandora or Spotify to.
+    """
+
+    _STATE_MAP = {
+        "playing": MediaPlayerState.PLAYING,
+        "paused": MediaPlayerState.PAUSED,
+        "idle": MediaPlayerState.IDLE,
+    }
+
+    def __init__(self, zone, entry_id):
+        """Initialize the AU7001 streaming zone entity."""
+        self._zone = zone
+        self._entry_id = entry_id
+        self._attr_name = zone.name
+        self._attr_unique_id = f"{DOMAIN}_{zone.udn}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, zone.udn)},
+            name=zone.name,
+            manufacturer="Legrand / NuVo",
+            model="AU7001",
+        )
+
+    async def async_update(self):
+        """Poll the device for its latest state."""
+        await self._zone.async_update()
+
+    @property
+    def available(self):
+        """Return True when the device is reachable."""
+        return self._zone.available
+
+    @property
+    def state(self):
+        """Return the playback state."""
+        return self._STATE_MAP.get(self._zone.state, MediaPlayerState.IDLE)
+
+    @property
+    def volume_level(self):
+        return self._zone.volume_level
+
+    @property
+    def is_volume_muted(self):
+        return self._zone.is_muted
+
+    @property
+    def media_title(self):
+        return self._zone.media_title
+
+    @property
+    def media_artist(self):
+        return self._zone.media_artist
+
+    @property
+    def media_album_name(self):
+        return self._zone.media_album
+
+    @property
+    def media_image_url(self):
+        return self._zone.media_image_url
+
+    @property
+    def media_duration(self):
+        return self._zone.media_duration
+
+    @property
+    def media_position(self):
+        return self._zone.media_position
+
+    @property
+    def supported_features(self):
+        features = (
+            MediaPlayerEntityFeature.PLAY
+            | MediaPlayerEntityFeature.PAUSE
+            | MediaPlayerEntityFeature.STOP
+            | MediaPlayerEntityFeature.NEXT_TRACK
+            | MediaPlayerEntityFeature.PREVIOUS_TRACK
+            | MediaPlayerEntityFeature.VOLUME_SET
+            | MediaPlayerEntityFeature.VOLUME_MUTE
+            | MediaPlayerEntityFeature.BROWSE_MEDIA
+        )
+        if self._zone.is_active:
+            features |= MediaPlayerEntityFeature.PLAY_MEDIA
+        return features
+
+    async def async_browse_media(
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """Browse Pandora and other services configured on the AU7001."""
+        if not self._zone.is_active:
+            raise BrowseError(
+                "AU7001 is inactive. Complete bind in the Digital Audio app "
+                "(bind button + solid white LED) before browsing."
+            )
+
+        object_id = media_content_id or NUVO_BROWSE_ROOT
+        result = await self._zone.async_browse(object_id)
+        if result is None:
+            raise BrowseError(f"Browse failed for {object_id}")
+
+        children: list[BrowseMedia] = []
+        for item in result.items:
+            if item.is_playable:
+                children.append(
+                    BrowseMedia(
+                        title=item.title,
+                        media_class=MediaClass.MUSIC,
+                        media_content_id=item.object_id,
+                        media_content_type=MediaType.MUSIC,
+                        can_play=True,
+                    )
+                )
+            elif item.is_container:
+                children.append(
+                    BrowseMedia(
+                        title=item.title,
+                        media_class=MediaClass.DIRECTORY,
+                        media_content_id=item.object_id,
+                        media_content_type=MediaType.URL,
+                        can_expand=True,
+                    )
+                )
+
+        return BrowseMedia(
+            title=result.title,
+            media_class=MediaClass.DIRECTORY,
+            media_content_id=result.object_id,
+            media_content_type=MediaType.URL,
+            children=children,
+            can_expand=True,
+        )
+
+    async def async_media_play(self):
+        await self._zone.async_play()
+        self.async_write_ha_state()
+
+    async def async_media_pause(self):
+        await self._zone.async_pause()
+        self.async_write_ha_state()
+
+    async def async_media_stop(self):
+        await self._zone.async_stop()
+        self.async_write_ha_state()
+
+    async def async_media_next_track(self):
+        await self._zone.async_next()
+
+    async def async_media_previous_track(self):
+        await self._zone.async_previous()
+
+    async def async_set_volume_level(self, volume):
+        await self._zone.async_set_volume(volume)
+        self.async_write_ha_state()
+
+    async def async_mute_volume(self, mute):
+        await self._zone.async_set_mute(mute)
+        self.async_write_ha_state()
+
+    async def async_play_media(self, media_type, media_id, **kwargs):
+        """Play an HTTP stream URL or a browsed NuVo container item."""
+        if not self._zone.is_active:
+            _LOGGER.warning(
+                "%s is inactive; bind the AU7001 before playback", self.name
+            )
+            return
+
+        if media_id.startswith(("http://", "https://")):
+            extra = kwargs.get("extra") or {}
+            title = extra.get("title") or kwargs.get("media_title") or "Stream"
+            if await self._zone.async_play_uri(media_id, title=title):
+                self.async_write_ha_state()
+            else:
+                _LOGGER.error("Failed to stream URL on %s", self.name)
+            return
+
+        if await self._zone.async_play_browse_item(media_id):
+            self.async_write_ha_state()
+        else:
+            _LOGGER.error("Failed to start playback for %s", media_id)

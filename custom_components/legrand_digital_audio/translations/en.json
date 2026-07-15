@@ -20,6 +20,10 @@
             "discovery_confirm": {
                 "title": "Legrand Digital Audio",
                 "description": "A Legrand Digital Audio device was found at {host}. Do you want to add it?"
+            },
+            "ssdp_confirm": {
+                "title": "Legrand Digital Audio",
+                "description": "Found a Legrand AU7001 streaming zone: {name}. Do you want to add it as a media player?"
             }
         },
         "error": {
