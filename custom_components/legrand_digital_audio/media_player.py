@@ -10,6 +10,7 @@ from homeassistant.components.media_player import (
     MediaPlayerState,
     MediaType,
 )
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK
 from homeassistant.helpers.entity import DeviceInfo
 
 from datetime import timedelta
@@ -28,6 +29,18 @@ SCAN_INTERVAL = timedelta(seconds=10)
 ALL_KEY = "all"
 
 
+def _au7000_device_info(device_id: str, host: str, port: int) -> DeviceInfo:
+    """Device registry entry for the AU7000 distribution module."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, device_id)},
+        name="Legrand Digital Audio (AU7000)",
+        manufacturer="Legrand / NuVo",
+        model="AU7000",
+        configuration_url=f"http://{host}:{port}",
+        connections={(CONNECTION_NETWORK, host)},
+    )
+
+
 async def async_setup_entry(hass, config, async_add_entities) -> None:
     """Set up the Legrand Digital Audio platform."""
     _LOGGER.debug("Setting up media_player entities for entry %s", config.entry_id)
@@ -40,6 +53,8 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
     connection = entry_data["connection"]
     zones = entry_data["zones"]
     entities_registry = entry_data["entities"]
+    device_id = config.unique_id or f"au7000_{connection.host}"
+    device_info = _au7000_device_info(device_id, connection.host, connection.port)
 
     entities = []
     zone_ids = []
@@ -55,7 +70,13 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
 
         zone_ids.append(f"{zone_id}")
         entity = LegrandDigitalAudio(
-            name, connection, zone_id, sources, entities_registry, config.entry_id
+            name,
+            connection,
+            zone_id,
+            sources,
+            entities_registry,
+            config.entry_id,
+            device_info,
         )
         entities_registry[zone_id] = entity
         entities.append(entity)
@@ -70,6 +91,7 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
         aggregate_sources,
         entities_registry,
         config.entry_id,
+        device_info,
     )
     entities_registry[ALL_KEY] = aggregate
     entities.append(aggregate)
@@ -88,6 +110,7 @@ class LegrandDigitalAudio(MediaPlayerEntity):
         sources,
         entities_registry,
         entry_id,
+        device_info,
     ):
         """Initialize the media player."""
         self._name = f"{name}"
@@ -100,6 +123,7 @@ class LegrandDigitalAudio(MediaPlayerEntity):
         self._is_muted = False
         self._entities_registry = entities_registry
         self._is_aggregate = isinstance(zone_id, list)
+        self._attr_device_info = device_info
 
         if self._is_aggregate:
             self._command_id = 100000000
@@ -370,11 +394,14 @@ class LegrandNuvoZone(MediaPlayerEntity):
         self._entry_id = entry_id
         self._attr_name = zone.name
         self._attr_unique_id = f"{DOMAIN}_{zone.udn}"
+        connections = {(CONNECTION_NETWORK, zone.host)} if zone.host else set()
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, zone.udn)},
             name=zone.name,
             manufacturer="Legrand / NuVo",
             model="AU7001",
+            configuration_url=zone.configuration_url,
+            connections=connections,
         )
 
     async def async_update(self):

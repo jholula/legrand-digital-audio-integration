@@ -204,6 +204,19 @@ class NuvoUpnpZone:
     def name(self) -> str:
         return self._name
 
+    @property
+    def host(self) -> str:
+        """IP address from the SSDP location URL."""
+        return urlsplit(self._location).hostname or ""
+
+    @property
+    def configuration_url(self) -> str | None:
+        """Base URL for the UPnP device description."""
+        if not self._location:
+            return None
+        split = urlsplit(self._location)
+        return f"{split.scheme}://{split.netloc}"
+
     def update_location(self, location: str) -> None:
         """Update the SSDP location (e.g. after the device rebooted on a new port)."""
         if location and location != self._location:
