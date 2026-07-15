@@ -2,6 +2,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import Platform
 
@@ -20,11 +21,12 @@ from .connection import LegrandConnection
 from .upnp import NuvoUpnpZone
 
 PLATFORMS = [Platform.MEDIA_PLAYER, Platform.BUTTON]
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the integration using YAML (if applicable)."""
+    """Set up the integration (config entries only)."""
     hass.data.setdefault(DOMAIN, {})
     return True
 

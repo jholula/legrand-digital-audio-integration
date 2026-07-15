@@ -4,6 +4,7 @@
     "codeowners": ["@jholula"],
     "config_flow": true,
     "dependencies": [],
+    "after_dependencies": ["network"],
     "dhcp": [
         { "macaddress": "0026EC*" }
     ],
