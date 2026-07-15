@@ -522,10 +522,32 @@ class LegrandNuvoZone(MediaPlayerEntity):
             )
             return
 
+        media_id = (media_id or "").strip()
         if media_id.startswith(("http://", "https://")):
             extra = kwargs.get("extra") or {}
-            title = extra.get("title") or kwargs.get("media_title") or "Stream"
+            metadata = extra.get("metadata") or {}
+            title = (
+                metadata.get("title")
+                or extra.get("title")
+                or kwargs.get("media_title")
+                or "Stream"
+            )
+            _LOGGER.info(
+                "Playing stream on %s from %s",
+                self.name,
+                media_id.split("?")[0][:120],
+            )
             if await self._zone.async_play_uri(media_id, title=title):
+                self._attr_media_content_id = media_id
+                self._attr_media_content_type = media_type or "music"
+                if title:
+                    self._zone.media_title = title
+                artist = metadata.get("artist")
+                if artist:
+                    self._zone.media_artist = artist
+                album = metadata.get("album") or metadata.get("albumName")
+                if album:
+                    self._zone.media_album = album
                 self.async_write_ha_state()
             else:
                 _LOGGER.error("Failed to stream URL on %s", self.name)

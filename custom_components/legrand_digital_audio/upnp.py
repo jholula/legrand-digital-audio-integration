@@ -638,6 +638,22 @@ class NuvoUpnpZone:
             )
             return False
 
+        uri = uri.strip()
+        if self.state != "idle":
+            # Music Assistant skips stop when paused; clear Pandora/nuvo first.
+            await self.async_stop()
+            await asyncio.sleep(0.5)
+
+        ext = uri.rsplit(".", 1)[-1].lower().split("?")[0]
+        if ext == "mp3":
+            protocol = "http-get:*:audio/mpeg:*"
+        elif ext in ("flac",):
+            protocol = "http-get:*:audio/flac:*"
+        elif ext in ("aac", "m4a"):
+            protocol = "http-get:*:audio/aac:*"
+        else:
+            protocol = "http-get:*:*:*"
+
         didl = (
             '<?xml version="1.0"?>'
             '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
@@ -646,9 +662,10 @@ class NuvoUpnpZone:
             '<item id="0" parentID="-1" restricted="1">'
             f"<dc:title>{html.escape(title)}</dc:title>"
             "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
-            f'<res protocolInfo="http-get:*:*:*">{uri}</res>'
+            f'<res protocolInfo="{protocol}">{uri}</res>'
             "</item></DIDL-Lite>"
         )
+        _LOGGER.debug("[%s] SetAVTransportURI %s", self._name, uri.split("?")[0])
         if await self._soap(
             UPNP_SERVICE_AVTRANSPORT,
             "SetAVTransportURI",
@@ -659,12 +676,25 @@ class NuvoUpnpZone:
             },
             raw_fields=_RAW_SOAP_FIELDS,
         ) is None:
+            _LOGGER.error("[%s] SetAVTransportURI rejected for %s", self._name, uri)
             return False
 
-        await self.async_play()
-        for _ in range(4):
+        if await self._soap(
+            UPNP_SERVICE_AVTRANSPORT, "Play", {"InstanceID": 0, "Speed": 1}
+        ) is None:
+            _LOGGER.error("[%s] Play rejected after SetAVTransportURI", self._name)
+            return False
+
+        for _ in range(6):
             await self.async_update()
-            if self.state == "playing":
+            if self.state in ("playing", "paused"):
                 return True
             await asyncio.sleep(1)
-        return False
+
+        # Device often reports nuvo metadata while HTTP is playing; Play succeeded.
+        _LOGGER.warning(
+            "[%s] Stream started but transport still idle; check AU7001 can reach %s",
+            self._name,
+            uri.split("/")[2] if "://" in uri else uri,
+        )
+        return True
