@@ -1,4 +1,8 @@
 import logging
+from urllib.parse import urlsplit
+
+from homeassistant.components import ssdp
+from homeassistant.components.ssdp import SsdpChange
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
@@ -16,6 +20,7 @@ from .const import (
     DEVICE_TYPE_AU7000,
     DEVICE_TYPE_AU7001,
     DOMAIN,
+    NUVO_ZONE_DEVICE_TYPE,
 )
 from .connection import LegrandConnection
 from .upnp import NuvoUpnpZone
@@ -150,6 +155,31 @@ async def _async_setup_au7001(hass: HomeAssistant, entry: ConfigEntry) -> None:
         CONF_DEVICE_TYPE: DEVICE_TYPE_AU7001,
         "upnp": zone,
     }
+
+    # Music Assistant stream start often resets the AU7001 UPnP stack onto a new
+    # HTTP control port. Keep the in-memory location fresh from SSDP alives
+    # without calling async_update_entry (which would reload the integration).
+    async def _async_ssdp_updated(discovery_info, change: SsdpChange) -> None:
+        if change == SsdpChange.BYEBYE:
+            return
+        new_location = discovery_info.ssdp_location
+        if not new_location:
+            return
+        target = (udn or "").lower()
+        discovered = (discovery_info.ssdp_udn or "").lower()
+        usn = (discovery_info.ssdp_usn or "").lower()
+        if target and discovered != target and target not in usn:
+            if urlsplit(new_location).hostname != zone.host:
+                return
+        zone.update_location(new_location)
+
+    entry.async_on_unload(
+        await ssdp.async_register_callback(
+            hass,
+            _async_ssdp_updated,
+            {"st": NUVO_ZONE_DEVICE_TYPE},
+        )
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

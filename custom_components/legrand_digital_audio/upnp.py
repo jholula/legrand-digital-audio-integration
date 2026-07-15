@@ -15,6 +15,7 @@ import html
 import json
 import logging
 import re
+import socket
 from dataclasses import dataclass, field
 from xml.etree import ElementTree
 from urllib.parse import urlsplit
@@ -25,6 +26,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import (
     NUVO_BROWSE_ROOT,
     NUVO_SERVICE_ZONE,
+    NUVO_ZONE_DEVICE_TYPE,
     UPNP_MAX_VOLUME,
     UPNP_SERVICE_AVTRANSPORT,
     UPNP_SERVICE_CONTENT_DIRECTORY,
@@ -40,6 +42,10 @@ from .stream_proxy import (
 _LOGGER = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 10
+SSDP_TIMEOUT = 2.0
+# Zone Get failures before marking the entity unavailable. AVTransport /
+# RenderingControl blips during Music Assistant stream start must not do this.
+ZONE_FAILURES_BEFORE_UNAVAILABLE = 3
 NUVO_NS = "urn:schemas.nuvotechnologies.com"
 DMS_ARGUMENTS = json.dumps(
     {"dms": {"id": "home-assistant", "title": "Home Assistant"}}
@@ -160,6 +166,51 @@ def _parse_group_id(master_group: str | None) -> str:
         return ""
 
 
+def _ssdp_discover_au7001() -> list[dict[str, str]]:
+    """Blocking SSDP M-SEARCH for AU7001 Zone devices."""
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 2\r\n"
+        f"ST: {NUVO_ZONE_DEVICE_TYPE}\r\n"
+        "\r\n"
+    ).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(SSDP_TIMEOUT)
+    devices: dict[str, dict[str, str]] = {}
+    try:
+        sock.sendto(msg, ("239.255.255.250", 1900))
+        while True:
+            data, _ = sock.recvfrom(65535)
+            text = data.decode(errors="replace")
+            location = udn = None
+            for line in text.split("\r\n"):
+                lower = line.lower()
+                if lower.startswith("location:"):
+                    location = line.split(":", 1)[1].strip()
+                if lower.startswith("usn:") and "uuid:" in lower:
+                    match = re.search(r"uuid:[^\s::]+", line, re.I)
+                    if match:
+                        udn = match.group(0)
+            if not location or location in devices:
+                continue
+            host = urlsplit(location).hostname or ""
+            devices[location] = {
+                "location": location,
+                "udn": udn or "",
+                "host": host,
+            }
+    except (TimeoutError, socket.timeout):
+        pass
+    except OSError as err:
+        _LOGGER.debug("SSDP discover failed: %s", err)
+    finally:
+        sock.close()
+    return list(devices.values())
+
+
 class NuvoUpnpZone:
     """Controls a single AU7001 streaming zone over UPnP/SOAP."""
 
@@ -172,6 +223,8 @@ class NuvoUpnpZone:
         self._base: str | None = None
         self._control_urls: dict[str, str] = {}
         self._available = False
+        self._zone_failures = 0
+        self._rediscovering = False
 
         # Polled state.
         self.state = "idle"  # idle | playing | paused
@@ -266,7 +319,7 @@ class NuvoUpnpZone:
     def update_location(self, location: str) -> None:
         """Update the SSDP location (e.g. after the device rebooted on a new port)."""
         if location and location != self._location:
-            _LOGGER.debug("[%s] Location updated: %s", self._name, location)
+            _LOGGER.info("[%s] Location updated: %s → %s", self._name, self._location, location)
             self._location = location
             self._base = None  # force re-resolve of control URLs
 
@@ -292,6 +345,7 @@ class NuvoUpnpZone:
                 body = await resp.text()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             _LOGGER.debug("[%s] Description fetch failed: %s", self._name, e)
+            self._base = None
             return False
 
         control_urls = dict(DEFAULT_CONTROL_URLS)
@@ -318,6 +372,35 @@ class NuvoUpnpZone:
         self._control_urls = control_urls
         return True
 
+    async def _async_rediscover_location(self) -> bool:
+        """SSDP rediscovery when the AU7001 moves to a new HTTP control port.
+
+        Music Assistant stream start often resets the device's UPnP stack; the
+        description URL port changes and the cached location goes stale.
+        """
+        if self._rediscovering:
+            return False
+        self._rediscovering = True
+        try:
+            devices = await self._hass.async_add_executor_job(_ssdp_discover_au7001)
+            host = self.host
+            udn = (self._udn or "").lower()
+            match = None
+            for device in devices:
+                device_udn = (device.get("udn") or "").lower()
+                if udn and device_udn and device_udn == udn:
+                    match = device
+                    break
+                if host and device.get("host") == host:
+                    match = device
+            if not match:
+                _LOGGER.debug("[%s] SSDP rediscovery found no matching AU7001", self._name)
+                return False
+            self.update_location(match["location"])
+            return await self._async_resolve()
+        finally:
+            self._rediscovering = False
+
     def _control_url(self, service_type: str) -> str:
         path = self._control_urls.get(
             service_type, DEFAULT_CONTROL_URLS.get(service_type, "")
@@ -338,9 +421,15 @@ class NuvoUpnpZone:
         args: dict | None = None,
         raw_fields: frozenset[str] | None = None,
     ):
-        """Invoke a SOAP action; return a dict of response fields or None."""
+        """Invoke a SOAP action; return a dict of response fields or None.
+
+        Connection errors clear the cached base URL so the next call re-resolves
+        the description. Only Zone failures affect entity availability — the
+        AU7001 routinely resets AVTransport/RenderingControl sockets when Music
+        Assistant starts a stream, and those blips must not mark the player
+        unavailable.
+        """
         if self._base is None and not await self._async_resolve():
-            self._available = False
             return None
 
         raw = raw_fields or _RAW_SOAP_FIELDS
@@ -395,7 +484,7 @@ class NuvoUpnpZone:
                     return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             _LOGGER.warning("[%s] SOAP %s failed: %s", self._name, action, e)
-            self._available = False
+            # Force description re-resolve; do not flip availability here.
             self._base = None
             return None
 
@@ -654,8 +743,14 @@ class NuvoUpnpZone:
         """Refresh Zone Get bind fields without transport/volume polling."""
         zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
         if zone is None:
-            self._available = False
+            if await self._async_rediscover_location():
+                zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if zone is None:
+            self._zone_failures += 1
+            if self._zone_failures >= ZONE_FAILURES_BEFORE_UNAVAILABLE:
+                self._available = False
             return False
+        self._zone_failures = 0
         self._apply_zone_get(zone)
         return True
 
@@ -690,13 +785,24 @@ class NuvoUpnpZone:
     # State polling
     # ------------------------------------------------------------------
     async def async_update(self):
-        """Refresh all polled state from the device."""
+        """Refresh all polled state from the device.
+
+        Zone Get is the availability heartbeat. Transport/volume/mute/position
+        are best-effort — failures during Music Assistant stream start are
+        common and must not take the entity offline.
+        """
         was_available = self._available
         zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
         if zone is None:
-            self._available = False
+            if await self._async_rediscover_location():
+                zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if zone is None:
+            self._zone_failures += 1
+            if self._zone_failures >= ZONE_FAILURES_BEFORE_UNAVAILABLE:
+                self._available = False
             return
 
+        self._zone_failures = 0
         self._apply_zone_get(zone)
         if not was_available and not self.active:
             # Power-loss capture: Active often returns within a few seconds
@@ -706,13 +812,14 @@ class NuvoUpnpZone:
         transport = await self._soap(
             UPNP_SERVICE_AVTRANSPORT, "GetTransportInfo", {"InstanceID": 0}
         )
-        tstate = (transport or {}).get("CurrentTransportState", "")
-        if tstate == "PLAYING":
-            self.state = "playing"
-        elif tstate == "PAUSED_PLAYBACK":
-            self.state = "paused"
-        else:
-            self.state = "idle"
+        if transport is not None:
+            tstate = transport.get("CurrentTransportState", "")
+            if tstate == "PLAYING":
+                self.state = "playing"
+            elif tstate == "PAUSED_PLAYBACK":
+                self.state = "paused"
+            else:
+                self.state = "idle"
 
         volume = await self._soap(
             UPNP_SERVICE_RENDERING,
