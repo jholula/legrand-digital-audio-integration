@@ -7,7 +7,10 @@ from homeassistant.const import Platform
 
 from .const import (
     CONF_DEVICE_TYPE,
+    DEFAULT_DEVICE_NAME_AU7000,
     DEFAULT_DEVICE_NAME_AU7001,
+    DEFAULT_ENTRY_TITLE_AU7000,
+    DEFAULT_ENTRY_TITLE_AU7001,
     DEFAULT_PORT,
     DEVICE_TYPE_AU7000,
     DEVICE_TYPE_AU7001,
@@ -32,6 +35,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device_type = entry.data.get(CONF_DEVICE_TYPE, DEVICE_TYPE_AU7000)
     hass.data.setdefault(DOMAIN, {})
 
+    _async_migrate_entry_names(hass, entry, device_type)
+
     if device_type == DEVICE_TYPE_AU7001:
         await _async_setup_au7001(hass, entry)
     else:
@@ -39,6 +44,54 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+
+def _async_migrate_entry_names(
+    hass: HomeAssistant, entry: ConfigEntry, device_type: str
+) -> None:
+    """Update config entry title/name left over from SSDP or older releases."""
+    if device_type == DEVICE_TYPE_AU7001:
+        desired_title = DEFAULT_ENTRY_TITLE_AU7001
+        desired_name = DEFAULT_DEVICE_NAME_AU7001
+        legacy_titles = {
+            "Legrand Digital Audio (AU7001)",
+            "Legrand Streaming Module (AU7001)",
+        }
+    else:
+        desired_title = DEFAULT_ENTRY_TITLE_AU7000
+        desired_name = DEFAULT_DEVICE_NAME_AU7000
+        legacy_titles = {
+            "Legrand Digital Audio",
+            "Legrand Digital Audio (AU7000)",
+        }
+
+    new_data = dict(entry.data)
+    data_changed = False
+
+    # Older AU7001 entries stored the raw SSDP friendlyName in "name".
+    current_name = new_data.get("name")
+    if device_type == DEVICE_TYPE_AU7001 and (
+        not current_name or str(current_name).startswith("NuVo Zone")
+    ):
+        if current_name:
+            new_data.setdefault("ssdp_friendly_name", current_name)
+        new_data["name"] = desired_name
+        data_changed = True
+
+    title_changed = False
+    if entry.title != desired_title and (
+        entry.title in legacy_titles or entry.title.startswith("NuVo Zone")
+    ):
+        title_changed = True
+
+    if not title_changed and not data_changed:
+        return
+
+    hass.config_entries.async_update_entry(
+        entry,
+        title=desired_title if title_changed else entry.title,
+        data=new_data if data_changed else entry.data,
+    )
 
 
 async def _async_setup_au7000(hass: HomeAssistant, entry: ConfigEntry) -> None:

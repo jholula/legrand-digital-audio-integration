@@ -14,5 +14,5 @@
     "iot_class": "local_polling",
     "issue_tracker": "https://github.com/jholula/legrand-digital-audio-integration/issues",
     "requirements": [],
-    "version": "1.3.0-rc.2"
+    "version": "1.3.0-rc.3"
 }
