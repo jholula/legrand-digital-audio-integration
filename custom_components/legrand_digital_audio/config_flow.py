@@ -15,6 +15,10 @@ from homeassistant.helpers.device_registry import format_mac
 
 from .const import (
     CONF_DEVICE_TYPE,
+    DEFAULT_DEVICE_NAME_AU7000,
+    DEFAULT_DEVICE_NAME_AU7001,
+    DEFAULT_ENTRY_TITLE_AU7000,
+    DEFAULT_ENTRY_TITLE_AU7001,
     DEFAULT_PORT,
     DEVICE_TYPE_AU7000,
     DEVICE_TYPE_AU7001,
@@ -238,7 +242,10 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="ssdp_confirm",
-            description_placeholders={"name": self._ssdp_name},
+            description_placeholders={
+                "name": self._ssdp_name,
+                "device_name": DEFAULT_DEVICE_NAME_AU7001,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -337,7 +344,7 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
 
         result = self.async_create_entry(
-            title=f"Legrand Digital Audio (AU7000)",
+            title=DEFAULT_ENTRY_TITLE_AU7000,
             data={
                 CONF_DEVICE_TYPE: DEVICE_TYPE_AU7000,
                 "host": host,
@@ -351,12 +358,13 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def _async_create_au7001_entry(self):
         """Create an AU7001 config entry, optionally queueing a companion flow."""
         result = self.async_create_entry(
-            title=self._ssdp_name or "Legrand Digital Audio (AU7001)",
+            title=DEFAULT_ENTRY_TITLE_AU7001,
             data={
                 CONF_DEVICE_TYPE: DEVICE_TYPE_AU7001,
                 "location": self._ssdp_location,
                 "udn": self._ssdp_udn,
-                "name": self._ssdp_name,
+                "name": DEFAULT_DEVICE_NAME_AU7001,
+                "ssdp_friendly_name": self._ssdp_name,
             },
         )
         self._schedule_companion_flow()
@@ -410,11 +418,11 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     def _label_au7000(host: str) -> str:
-        return f"Distribution module (AU7000) — {host}"
+        return f"{DEFAULT_DEVICE_NAME_AU7000} — {host}"
 
     @staticmethod
     def _label_au7001(device: dict) -> str:
-        return f"Streaming module (AU7001) — {device['name']} ({device['host']})"
+        return f"{DEFAULT_DEVICE_NAME_AU7001} — {device['host']}"
 
     @staticmethod
     def _label_manual_au7000() -> str:

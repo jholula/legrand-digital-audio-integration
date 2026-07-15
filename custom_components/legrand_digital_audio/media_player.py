@@ -16,6 +16,8 @@ from homeassistant.helpers.entity import DeviceInfo
 from datetime import timedelta
 from .const import (
     CONF_DEVICE_TYPE,
+    DEFAULT_DEVICE_NAME_AU7000,
+    DEFAULT_DEVICE_NAME_AU7001,
     DEVICE_TYPE_AU7000,
     DEVICE_TYPE_AU7001,
     DOMAIN,
@@ -33,7 +35,7 @@ def _au7000_device_info(device_id: str, host: str, port: int) -> DeviceInfo:
     """Device registry entry for the AU7000 distribution module."""
     return DeviceInfo(
         identifiers={(DOMAIN, device_id)},
-        name="Legrand Digital Audio (AU7000)",
+        name=DEFAULT_DEVICE_NAME_AU7000,
         manufacturer="Legrand / NuVo",
         model="AU7000",
         configuration_url=f"http://{host}:{port}",
@@ -138,6 +140,7 @@ class LegrandDigitalAudio(MediaPlayerEntity):
                 int(f"{zone_id.replace('Z', '')}00000000") + 100000000
             )
             self._unique_id = f"{DOMAIN}_{self._zone_id}"
+            self._attr_suggested_object_id = f"legrand_{name}"
 
     def _get_next_command_id(self):
         """Generate the next unique command ID."""
@@ -392,12 +395,13 @@ class LegrandNuvoZone(MediaPlayerEntity):
         """Initialize the AU7001 streaming zone entity."""
         self._zone = zone
         self._entry_id = entry_id
-        self._attr_name = zone.name
+        self._attr_name = DEFAULT_DEVICE_NAME_AU7001
         self._attr_unique_id = f"{DOMAIN}_{zone.udn}"
+        self._attr_suggested_object_id = "legrand_digital_audio_module"
         connections = {(CONNECTION_NETWORK, zone.host)} if zone.host else set()
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, zone.udn)},
-            name=zone.name,
+            name=DEFAULT_DEVICE_NAME_AU7001,
             manufacturer="Legrand / NuVo",
             model="AU7001",
             configuration_url=zone.configuration_url,

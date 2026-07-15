@@ -30,7 +30,7 @@
             },
             "ssdp_confirm": {
                 "title": "Add streaming module (AU7001)",
-                "description": "Add **{name}** as a streaming media player?\n\n**Before using streaming:**\n1. Open the Digital Audio app → Settings → **Bind Digital Source** and press the bind button on the AU7001 until the LED is **solid white**.\n2. Sign in to Pandora/Spotify in the app if you want those services.\n\n**Music Assistant:** After setup, go to Music Assistant → Settings → Player providers → enable **Home Assistant**, then add this entity as a player. The AU7001 must stay bound (Active) for playback to work."
+                "description": "Add **{device_name}** as a streaming media player? (Discovered on the network as *{name}*.)\n\n**Before using streaming:**\n1. Open the Digital Audio app → Settings → **Bind Digital Source** and press the bind button on the AU7001 until the LED is **solid white**.\n2. Sign in to Pandora/Spotify in the app if you want those services.\n\n**Music Assistant:** After setup, go to Music Assistant → Settings → Player providers → enable **Home Assistant**, then add this entity as a player. The AU7001 must stay bound (Active) for playback to work."
             },
             "recommend_companion": {
                 "title": "Add companion device?",

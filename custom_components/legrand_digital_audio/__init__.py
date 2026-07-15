@@ -7,6 +7,7 @@ from homeassistant.const import Platform
 
 from .const import (
     CONF_DEVICE_TYPE,
+    DEFAULT_DEVICE_NAME_AU7001,
     DEFAULT_PORT,
     DEVICE_TYPE_AU7000,
     DEVICE_TYPE_AU7001,
@@ -78,7 +79,7 @@ async def _async_setup_au7001(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up an AU7001 streaming zone (UPnP/SOAP control)."""
     location = entry.data["location"]
     udn = entry.data["udn"]
-    name = entry.data.get("name", "Legrand Digital Audio")
+    name = entry.data.get("name", DEFAULT_DEVICE_NAME_AU7001)
 
     _LOGGER.info("Setting up Legrand AU7001 streaming zone '%s' (%s)", name, udn)
 

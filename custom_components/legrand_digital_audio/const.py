@@ -36,3 +36,9 @@ NUVO_BROWSE_ROOT = "/nuvo/musicAddService"
 
 # The AU7001 uses standard UPnP RenderingControl volume, scaled 0..100.
 UPNP_MAX_VOLUME = 100
+
+# Default names shown in the device registry, entity list, and config entry titles.
+DEFAULT_DEVICE_NAME_AU7000 = "Legrand Distribution Module"
+DEFAULT_DEVICE_NAME_AU7001 = "Legrand Digital Audio Module"
+DEFAULT_ENTRY_TITLE_AU7000 = "Legrand Distribution Module (AU7000)"
+DEFAULT_ENTRY_TITLE_AU7001 = "Legrand Digital Audio Module (AU7001)"
