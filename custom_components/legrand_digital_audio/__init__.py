@@ -186,16 +186,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.info("Unloading Legrand Digital Audio config entry")
 
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
-    entry_data = hass.data[DOMAIN].pop(entry.entry_id, None)
+    # Cancel in-flight UPnP/TCP work before platform unload so polls cannot
+    # hold the entry in unload_in_progress.
+    entry_data = hass.data[DOMAIN].get(entry.entry_id)
     if entry_data:
-        if "connection" in entry_data:
+        if "upnp" in entry_data:
+            await entry_data["upnp"].async_close()
+        elif "connection" in entry_data:
             try:
                 await entry_data["connection"].async_close()
             except Exception as e:  # noqa: BLE001
                 _LOGGER.error("Error closing connection: %s", e)
-        elif "upnp" in entry_data:
-            await entry_data["upnp"].async_close()
 
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok

@@ -207,7 +207,14 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="cannot_connect")
 
         await self.async_set_unique_id(udn)
-        self._abort_if_unique_id_configured(updates={"location": location})
+        # Persist new control-port location for the next cold start, but do not
+        # reload — AU7001 SSDP re-announces often during Music Assistant streams
+        # and a mid-stream reload hangs unload_in_progress / marks unavailable.
+        # Runtime port changes use the in-memory SSDP callback in __init__.py.
+        self._abort_if_unique_id_configured(
+            updates={"location": location},
+            reload_on_update=False,
+        )
 
         self._ssdp_location = location
         self._ssdp_udn = udn

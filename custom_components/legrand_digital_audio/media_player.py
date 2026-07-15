@@ -480,7 +480,11 @@ class LegrandNuvoZone(MediaPlayerEntity):
 
     async def async_update(self):
         """Poll the device for its latest state."""
+        if getattr(self._zone, "_closed", False):
+            return
         await self._zone.async_update()
+        if getattr(self._zone, "_closed", False):
+            return
         self._dim_connecting = await _async_dim_connecting(self.hass, self._zone.udn)
 
     async def async_attempt_bind(self) -> None:
@@ -598,7 +602,9 @@ class LegrandNuvoZone(MediaPlayerEntity):
         object_id = media_content_id or NUVO_BROWSE_ROOT
         result = await self._zone.async_browse(object_id)
         if result is None:
-            raise BrowseError(f"Browse failed for {object_id}")
+            raise BrowseError(
+                self._zone.last_browse_error or f"Browse failed for {object_id}"
+            )
 
         children: list[BrowseMedia] = []
         for item in result.items:

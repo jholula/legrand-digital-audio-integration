@@ -43,6 +43,8 @@ from .stream_proxy import (
 _LOGGER = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 10
+# Poll Gets must fail fast so config-entry unload is not blocked for 10s+.
+POLL_TIMEOUT = 3
 SSDP_TIMEOUT = 2.0
 # Zone Get failures before marking the entity unavailable. AVTransport /
 # RenderingControl blips during Music Assistant stream start must not do this.
@@ -69,7 +71,10 @@ DEFAULT_CONTROL_URLS = {
 # Play may return HTTP 500 while still starting transport.
 _SOAP_FAULT_OK_ACTIONS = frozenset({"X_NUVO_PlayContainerURI"})
 
-# SOAP metadata fields carry embedded DIDL-Lite XML and must not be escaped.
+# SetAVTransportURI / Browse Action metadata may carry nested DIDL as raw XML.
+# X_NUVO_PlayContainerURI is the opposite: the Digital Audio app HTML-escapes
+# CurrentURIMetaData / TrackURIMetaData (&lt;DIDL-Lite…), and unescaped DIDL
+# makes the DIM reject the station as "unavailable or not playable".
 _RAW_SOAP_FIELDS = frozenset(
     {
         "CurrentURIMetaData",
@@ -77,6 +82,13 @@ _RAW_SOAP_FIELDS = frozenset(
         "MetaData",
         "ParentMetaData",
     }
+)
+
+_DIDL_LITE_WRAPPER = (
+    '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+    'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+    'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+    'xmlns:x="urn:schemas.nuvotechnologies.com">'
 )
 
 
@@ -161,6 +173,20 @@ def _element_xml(elem: ElementTree.Element) -> str:
     return ElementTree.tostring(elem, encoding="unicode")
 
 
+def _as_didl_lite(fragment: str) -> str:
+    """Wrap a bare <item>/<container> fragment in DIDL-Lite if needed.
+
+    PlayContainerURI requires TrackURIMetaData to be a full DIDL-Lite document
+    (matching the Digital Audio app), not a naked browse Result child.
+    """
+    text = (fragment or "").strip()
+    if not text:
+        return ""
+    if text.lstrip().startswith("<DIDL-Lite") or text.lstrip().startswith("<ns0:DIDL"):
+        return text
+    return f"{_DIDL_LITE_WRAPPER}{text}</DIDL-Lite>"
+
+
 def _parse_group_id(master_group: str | None) -> str:
     """Extract the group id string from the Zone MasterGroup JSON field."""
     if not master_group:
@@ -231,6 +257,7 @@ class NuvoUpnpZone:
         self._available = False
         self._zone_failures = 0
         self._rediscovering = False
+        self._closed = False
         self._hold_available_until = 0.0
 
         # Polled state.
@@ -259,6 +286,7 @@ class NuvoUpnpZone:
         self._waiting_for_active = False
         self._stream_proxy: Id3StreamProxy | None = None
         self._stream_metadata: dict[str, str | None] | None = None
+        self.last_browse_error: str | None = None
 
     @property
     def available(self) -> bool:
@@ -329,6 +357,10 @@ class NuvoUpnpZone:
             _LOGGER.info("[%s] Location updated: %s → %s", self._name, self._location, location)
             self._location = location
             self._base = None  # force re-resolve of control URLs
+            # Subscribe queues die with the old UPnP HTTP port.
+            self._queue_id = None
+            self._browse_context = None
+            self._items_by_id.clear()
             # Port churn means Zone Get will fail briefly; do not flap available.
             self._hold_available()
 
@@ -361,6 +393,11 @@ class NuvoUpnpZone:
 
     async def async_close(self):
         """Release browse state (no persistent socket for UPnP)."""
+        # Stop polls/rediscovery immediately so config-entry unload cannot hang
+        # in unload_in_progress while SOAP/SSDP work is still in flight.
+        self._closed = True
+        self._waiting_for_active = False
+        self._rediscovering = False
         await self._async_stop_stream_proxy()
         self._queue_id = None
         self._browse_context = None
@@ -372,11 +409,13 @@ class NuvoUpnpZone:
     # ------------------------------------------------------------------
     async def _async_resolve(self) -> bool:
         """Fetch the device description and resolve control URLs."""
+        if self._closed:
+            return False
         split = urlsplit(self._location)
         self._base = f"{split.scheme}://{split.netloc}"
         session = async_get_clientsession(self._hass)
         try:
-            async with session.get(self._location, timeout=REQUEST_TIMEOUT) as resp:
+            async with session.get(self._location, timeout=POLL_TIMEOUT) as resp:
                 resp.raise_for_status()
                 body = await resp.text()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -414,13 +453,15 @@ class NuvoUpnpZone:
         Music Assistant stream start often resets the device's UPnP stack; the
         description URL port changes and the cached location goes stale.
         """
-        if self._rediscovering:
+        if self._closed or self._rediscovering:
             return False
         self._rediscovering = True
         try:
             host = self.host
             udn = (self._udn or "").lower()
             for attempt in range(REDISCOVER_ATTEMPTS):
+                if self._closed:
+                    return False
                 devices = await self._hass.async_add_executor_job(
                     _ssdp_discover_au7001
                 )
@@ -466,6 +507,8 @@ class NuvoUpnpZone:
         action: str,
         args: dict | None = None,
         raw_fields: frozenset[str] | None = None,
+        *,
+        timeout: float | None = None,
     ):
         """Invoke a SOAP action; return a dict of response fields or None.
 
@@ -475,10 +518,16 @@ class NuvoUpnpZone:
         Assistant starts a stream, and those blips must not mark the player
         unavailable.
         """
+        if self._closed:
+            return None
         if self._base is None and not await self._async_resolve():
             return None
+        if self._closed:
+            return None
 
-        raw = raw_fields or _RAW_SOAP_FIELDS
+        # Use `is None` so callers can pass frozenset() to force escaping all
+        # fields (empty set is falsy and must not fall back to _RAW_SOAP_FIELDS).
+        raw = _RAW_SOAP_FIELDS if raw_fields is None else raw_fields
         parts = []
         for key, value in (args or {}).items():
             text = str(value)
@@ -499,13 +548,15 @@ class NuvoUpnpZone:
             "Content-Type": 'text/xml; charset="utf-8"',
             "SOAPACTION": f'"{service_type}#{action}"',
         }
+        if timeout is None:
+            timeout = POLL_TIMEOUT if action.startswith("Get") else REQUEST_TIMEOUT
         session = async_get_clientsession(self._hass)
         try:
             async with session.post(
                 self._control_url(service_type),
                 data=envelope.encode("utf-8"),
                 headers=headers,
-                timeout=REQUEST_TIMEOUT,
+                timeout=timeout,
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
@@ -551,7 +602,7 @@ class NuvoUpnpZone:
     # ------------------------------------------------------------------
     # Browse / play (ContentDirectory + AVTransport)
     # ------------------------------------------------------------------
-    async def _async_ensure_queue(self) -> str | None:
+    async def _async_ensure_queue(self, *, force_new: bool = False) -> str | None:
         """Create or reuse the ContentDirectory subscription queue."""
         if not self.active:
             _LOGGER.warning(
@@ -559,9 +610,10 @@ class NuvoUpnpZone:
                 self._name,
             )
             return None
-        if self._queue_id:
+        if self._queue_id and not force_new:
             return self._queue_id
 
+        self._queue_id = None
         resp = await self._soap(
             UPNP_SERVICE_CONTENT_DIRECTORY, "X_NUVO_CreateSubscribeQueue", {}
         )
@@ -570,17 +622,11 @@ class NuvoUpnpZone:
         self._queue_id = resp["QueueID"]
         return self._queue_id
 
-    async def async_browse(
-        self,
-        object_id: str = NUVO_BROWSE_ROOT,
-        browse_flag: str = "BrowseDirectChildren",
-    ) -> NuvoBrowseResult | None:
-        """Browse the on-device music menu via X_NUVO_Browse2."""
-        queue_id = await self._async_ensure_queue()
-        if not queue_id:
-            return None
-
-        resp = await self._soap(
+    async def _async_browse2(
+        self, object_id: str, browse_flag: str, queue_id: str
+    ) -> dict[str, str] | None:
+        """Invoke X_NUVO_Browse2 once."""
+        return await self._soap(
             UPNP_SERVICE_CONTENT_DIRECTORY,
             "X_NUVO_Browse2",
             {
@@ -597,13 +643,53 @@ class NuvoUpnpZone:
                 "Arguments": DMS_ARGUMENTS,
             },
         )
+
+    async def async_browse(
+        self,
+        object_id: str = NUVO_BROWSE_ROOT,
+        browse_flag: str = "BrowseDirectChildren",
+    ) -> NuvoBrowseResult | None:
+        """Browse the on-device music menu via X_NUVO_Browse2."""
+        self.last_browse_error = None
+        if not self.active:
+            self.last_browse_error = (
+                "AU7001 is inactive. Complete bind (solid white LED) before browsing."
+            )
+            return None
+
+        queue_id = await self._async_ensure_queue()
+        if not queue_id:
+            self.last_browse_error = (
+                "Could not create a ContentDirectory subscribe queue. "
+                "Stop Music Assistant playback and retry, or reload the AU7001 entry."
+            )
+            return None
+
+        resp = await self._async_browse2(object_id, browse_flag, queue_id)
         if not resp:
+            # Stale queue IDs are common after the AU7001 moves UPnP ports.
+            _LOGGER.debug(
+                "[%s] Browse2 failed for %s; recreating subscribe queue",
+                self._name,
+                object_id,
+            )
+            queue_id = await self._async_ensure_queue(force_new=True)
+            if queue_id:
+                resp = await self._async_browse2(object_id, browse_flag, queue_id)
+
+        if not resp:
+            self.last_browse_error = (
+                f"Browse failed for {object_id}. The AU7001 may be busy with "
+                "Music Assistant streaming — stop MA playback and try again."
+            )
             return None
 
         result = self._parse_browse_result(object_id, resp)
-        if result:
-            self._browse_context = result
-            self._items_by_id = {item.object_id: item for item in result.items}
+        if result is None:
+            self.last_browse_error = f"Browse response for {object_id} could not be parsed."
+            return None
+        self._browse_context = result
+        self._items_by_id = {item.object_id: item for item in result.items}
         return result
 
     def _parse_browse_result(
@@ -642,8 +728,15 @@ class NuvoUpnpZone:
                 continue
 
             is_container = tag == "container" or "container" in item_class
+            # Pandora stations are <item> rows under pandora:StationList; class is
+            # usually audioItem/audioBroadcast, but treat known service ids as
+            # playable even when the firmware omits/oddly labels upnp:class.
             is_playable = tag == "item" and (
-                "audioItem" in item_class or "audioBroadcast" in item_class
+                "audioItem" in item_class
+                or "audioBroadcast" in item_class
+                or oid.startswith(
+                    ("pandora:", "spotify:", "siriusxm:", "tunein:", "nuvo:")
+                )
             )
             browse_item = NuvoBrowseItem(
                 object_id=oid,
@@ -681,33 +774,107 @@ class NuvoUpnpZone:
         item = self._items_by_id.get(item_id)
         context = self._browse_context
         if item is None or context is None:
+            # Media browser may call play after the in-memory browse cache was
+            # cleared (UPnP port change). Re-browse the parent container once.
+            parent = item_id.rsplit("/", 1)[0] if "/" in item_id else None
+            if parent:
+                _LOGGER.debug(
+                    "[%s] Browse cache miss for %s; re-browsing %s",
+                    self._name,
+                    item_id,
+                    parent,
+                )
+                await self.async_browse(parent)
+                item = self._items_by_id.get(item_id)
+                context = self._browse_context
+        if item is None or context is None:
             _LOGGER.warning(
                 "[%s] Unknown browse item %s; browse the parent container first",
                 self._name,
                 item_id,
             )
             return False
+        if not (context.container_didl or "").strip():
+            _LOGGER.warning(
+                "[%s] Missing ContainerProperties for %s; re-browsing parent",
+                self._name,
+                item_id,
+            )
+            parent = context.object_id or (
+                item_id.rsplit("/", 1)[0] if "/" in item_id else None
+            )
+            if parent:
+                await self.async_browse(parent)
+                item = self._items_by_id.get(item_id) or item
+                context = self._browse_context or context
+        if not (context.container_didl or "").strip():
+            _LOGGER.error(
+                "[%s] Cannot play %s without ContainerProperties",
+                self._name,
+                item_id,
+            )
+            return False
+
+        # Clear Music Assistant / prior transport before Pandora/NuVo play.
+        await self._async_stop_stream_proxy()
+        if self.state != "idle":
+            await self.async_stop()
+            await asyncio.sleep(0.75)
 
         track_uri = item_id if item_id.startswith("nuvo:") else f"nuvo:{item_id}"
-        await self._soap(
+        track_meta = _as_didl_lite(item.didl_xml)
+        container_meta = _as_didl_lite(context.container_didl)
+        _LOGGER.info(
+            "[%s] PlayContainerURI %s (index=%s)",
+            self._name,
+            item_id,
+            item.index + 1,
+        )
+        _LOGGER.debug(
+            "[%s] PlayContainerURI meta lengths container=%s track=%s",
+            self._name,
+            len(container_meta),
+            len(track_meta),
+        )
+        # Escape DIDL fields (raw_fields=empty). Nested unescaped DIDL is
+        # rejected as "unavailable or not playable by Legrand DIM".
+        resp = await self._soap(
             UPNP_SERVICE_AVTRANSPORT,
             "X_NUVO_PlayContainerURI",
             {
                 "InstanceID": 0,
                 "CurrentURI": "",
-                "CurrentURIMetaData": context.container_didl,
+                "CurrentURIMetaData": container_meta,
                 "TrackURI": track_uri,
-                "TrackURIMetaData": item.didl_xml,
+                "TrackURIMetaData": track_meta,
                 "StartingIndex": item.index + 1,
                 "UpdateID": -1,
             },
-            raw_fields=_RAW_SOAP_FIELDS,
+            raw_fields=frozenset(),
         )
-        for _ in range(4):
-            await self.async_update()
+
+        self.media_title = item.title
+        if item_id.startswith("pandora:"):
+            self.media_artist = "pandora"
+        self._hold_available()
+
+        for _ in range(10):
+            await self._async_refresh_transport()
             if self.state == "playing":
                 return True
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.75)
+
+        if resp is not None:
+            # HTTP 200 or the known fault-OK path; device may still be buffering.
+            self.state = "playing"
+            _LOGGER.info(
+                "[%s] PlayContainerURI accepted for %s; transport not confirmed yet",
+                self._name,
+                item_id,
+            )
+            return True
+
+        _LOGGER.error("[%s] PlayContainerURI failed for %s", self._name, item_id)
         return False
 
     # ------------------------------------------------------------------
@@ -787,10 +954,16 @@ class NuvoUpnpZone:
 
     async def async_update_zone_only(self) -> bool:
         """Refresh Zone Get bind fields without transport/volume polling."""
+        if self._closed:
+            return False
         zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if self._closed:
+            return False
         if zone is None:
             if await self._async_rediscover_location():
                 zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if self._closed:
+            return False
         if zone is None:
             self._note_zone_failure()
             return False
@@ -800,12 +973,12 @@ class NuvoUpnpZone:
 
     async def _async_wait_for_active(self, attempts: int = 8, delay: float = 1.0):
         """Poll briefly after reconnect; firmware often restores Active itself."""
-        if self._waiting_for_active:
+        if self._waiting_for_active or self._closed:
             return
         self._waiting_for_active = True
         try:
             for _ in range(attempts):
-                if self.active or not self._available:
+                if self._closed or self.active or not self._available:
                     return
                 await asyncio.sleep(delay)
                 await self.async_update_zone_only()
@@ -834,9 +1007,13 @@ class NuvoUpnpZone:
         Used after Music Assistant stream start so confirmation polling does not
         hammer Zone Get (and mark the entity unavailable) while UPnP restarts.
         """
+        if self._closed:
+            return
         transport = await self._soap(
             UPNP_SERVICE_AVTRANSPORT, "GetTransportInfo", {"InstanceID": 0}
         )
+        if self._closed:
+            return
         if transport is not None:
             tstate = transport.get("CurrentTransportState", "")
             if tstate == "PLAYING":
@@ -877,11 +1054,17 @@ class NuvoUpnpZone:
         are best-effort — failures during Music Assistant stream start are
         common and must not take the entity offline.
         """
+        if self._closed:
+            return
         was_available = self._available
         zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if self._closed:
+            return
         if zone is None:
             if await self._async_rediscover_location():
                 zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if self._closed:
+            return
         if zone is None:
             self._note_zone_failure()
             # Still try transport so now-playing can recover on the new port.
