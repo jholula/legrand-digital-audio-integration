@@ -30,6 +30,12 @@ from .const import (
     UPNP_SERVICE_CONTENT_DIRECTORY,
     UPNP_SERVICE_RENDERING,
 )
+from .stream_proxy import (
+    Id3StreamProxy,
+    async_fetch_image,
+    async_local_ip_toward,
+    build_id3v2,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -191,6 +197,8 @@ class NuvoUpnpZone:
         self._browse_context: NuvoBrowseResult | None = None
         self._items_by_id: dict[str, NuvoBrowseItem] = {}
         self._waiting_for_active = False
+        self._stream_proxy: Id3StreamProxy | None = None
+        self._stream_metadata: dict[str, str | None] | None = None
 
     @property
     def available(self) -> bool:
@@ -264,9 +272,11 @@ class NuvoUpnpZone:
 
     async def async_close(self):
         """Release browse state (no persistent socket for UPnP)."""
+        await self._async_stop_stream_proxy()
         self._queue_id = None
         self._browse_context = None
         self._items_by_id.clear()
+        self._stream_metadata = None
 
     # ------------------------------------------------------------------
     # Description / control-URL resolution
@@ -729,7 +739,11 @@ class NuvoUpnpZone:
             self._parse_metadata(position.get("TrackMetaData", ""))
 
     def _parse_metadata(self, didl: str):
-        """Extract title/artist/album/art from DIDL-Lite metadata."""
+        """Extract title/artist/album/art from DIDL-Lite metadata.
+
+        Pandora/NuVo put the service name in dc:creator (e.g. "pandora") and
+        the real performer in upnp:artist / x_nuvo_nsdk.metaData — prefer those.
+        """
         self.media_title = None
         self.media_artist = None
         self.media_album = None
@@ -739,19 +753,63 @@ class NuvoUpnpZone:
         root = _parse_didl(didl)
         if root is None:
             return
+
+        title = None
+        artist = None
+        creator = None
+        album = None
+        image = None
+        nsdk_raw = None
+
         for elem in root.iter():
             tag = _local(elem.tag)
             text = (elem.text or "").strip()
+            if tag == "x_nuvo_nsdk" and text:
+                nsdk_raw = text
+                continue
             if not text:
                 continue
-            if tag == "title":
-                self.media_title = text
-            elif tag in ("artist", "creator"):
-                self.media_artist = self.media_artist or text
+            if tag == "title" and title is None:
+                # First dc:title is the track; nested containers may add more.
+                title = text
+            elif tag == "artist":
+                artist = text
+            elif tag == "creator":
+                creator = text
             elif tag == "album":
-                self.media_album = text
+                album = text
             elif tag in ("albumArtURI", "icon") and text.startswith("http"):
-                self.media_image_url = text
+                image = image or text
+
+        nsdk_artist = nsdk_album = nsdk_title = nsdk_icon = None
+        if nsdk_raw:
+            try:
+                nsdk = json.loads(html.unescape(nsdk_raw))
+            except (json.JSONDecodeError, TypeError):
+                nsdk = None
+            if isinstance(nsdk, dict):
+                nsdk_title = nsdk.get("title") or None
+                nsdk_icon = nsdk.get("icon") if isinstance(nsdk.get("icon"), str) else None
+                meta = (nsdk.get("mediaData") or {}).get("metaData") or {}
+                if isinstance(meta, dict):
+                    nsdk_artist = meta.get("artist") or None
+                    nsdk_album = meta.get("album") or None
+
+        self.media_title = title or nsdk_title
+        # Never treat the streaming-service id (dc:creator) as the performer.
+        service_ids = {"pandora", "spotify", "siriusxm", "tunein", "http", "nuvo"}
+        if artist:
+            self.media_artist = artist
+        elif nsdk_artist:
+            self.media_artist = nsdk_artist
+        elif creator and creator.lower() not in service_ids:
+            self.media_artist = creator
+
+        self.media_album = album or nsdk_album
+        if image:
+            self.media_image_url = image
+        elif isinstance(nsdk_icon, str) and nsdk_icon.startswith("http"):
+            self.media_image_url = nsdk_icon
 
     # ------------------------------------------------------------------
     # Transport commands
@@ -766,6 +824,8 @@ class NuvoUpnpZone:
 
     async def async_stop(self):
         await self._soap(UPNP_SERVICE_AVTRANSPORT, "Stop", {"InstanceID": 0})
+        await self._async_stop_stream_proxy()
+        self._stream_metadata = None
 
     async def async_next(self):
         await self._soap(UPNP_SERVICE_AVTRANSPORT, "Next", {"InstanceID": 0})
@@ -788,6 +848,158 @@ class NuvoUpnpZone:
             {"InstanceID": 0, "Channel": "Master", "DesiredMute": 1 if mute else 0},
         )
 
+    async def _async_advertise_host(
+        self, device_host: str | None, device_port: int
+    ) -> str | None:
+        """Pick a LAN IP the AU7001 can use to fetch the ID3 proxy."""
+        # Prefer HA's network helper when available (correct under Docker/HAOS).
+        try:
+            from homeassistant.components.network import async_get_source_ip
+
+            if device_host:
+                ip = await async_get_source_ip(self._hass, target_ip=device_host)
+                if ip:
+                    return ip
+        except Exception as err:  # noqa: BLE001 - optional HA API
+            _LOGGER.debug("[%s] async_get_source_ip unavailable: %s", self._name, err)
+
+        if device_host:
+            return await async_local_ip_toward(device_host, device_port)
+        return None
+
+    async def _async_stop_stream_proxy(self) -> None:
+        proxy = self._stream_proxy
+        self._stream_proxy = None
+        if proxy is not None:
+            await proxy.stop()
+
+    async def _async_prepare_play_uri(
+        self,
+        uri: str,
+        title: str,
+        artist: str | None,
+        album: str | None,
+        image_url: str | None,
+    ) -> str:
+        """Return the URL the AU7001 should fetch, with ID3 tags if needed.
+
+        Firmware ignores DIDL for HTTP streams and reads ID3 from the audio
+        bytes instead. When we have now-playing fields, proxy the upstream
+        URL and prepend an ID3v2 tag.
+        """
+        await self._async_stop_stream_proxy()
+        self._stream_metadata = {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "image_url": image_url,
+        }
+        if not any((title and title != "Stream", artist, album)):
+            return uri
+
+        split = urlsplit(self._location)
+        device_host = split.hostname
+        device_port = split.port or (443 if split.scheme == "https" else 80)
+        advertise_host = await self._async_advertise_host(device_host, device_port)
+        if not advertise_host:
+            _LOGGER.warning(
+                "[%s] Could not determine local IP for ID3 proxy; "
+                "AU7001 may show Unknown artist/album",
+                self._name,
+            )
+            return uri
+
+        image = None
+        image_mime = "image/jpeg"
+        if image_url and image_url.startswith(("http://", "https://")):
+            session = async_get_clientsession(self._hass)
+            fetched = await async_fetch_image(session, image_url)
+            if fetched:
+                image, image_mime = fetched
+
+        id3 = build_id3v2(
+            title=title or None,
+            artist=artist,
+            album=album,
+            image=image,
+            image_mime=image_mime,
+        )
+        if not id3:
+            return uri
+
+        session = async_get_clientsession(self._hass)
+        proxy = Id3StreamProxy(session, uri, id3, advertise_host)
+        try:
+            play_url = await proxy.start()
+        except OSError as err:
+            _LOGGER.warning("[%s] ID3 stream proxy failed to start: %s", self._name, err)
+            return uri
+
+        self._stream_proxy = proxy
+        _LOGGER.info(
+            "[%s] Proxying stream with ID3 tags (title=%s artist=%s album=%s)",
+            self._name,
+            title,
+            artist or "-",
+            album or "-",
+        )
+        return play_url
+
+    def _build_stream_didl(
+        self,
+        uri: str,
+        title: str,
+        artist: str | None,
+        album: str | None,
+        image_url: str | None,
+        protocol: str,
+    ) -> str:
+        """Build DIDL matching the shape Pandora now-playing uses on the AU7001."""
+        description = f"{album or ''} - {artist or ''}"
+        nsdk = {
+            "mediaData": {
+                "metaData": {
+                    **({"artist": artist} if artist else {}),
+                    **({"album": album} if album else {}),
+                    "serviceID": "http",
+                },
+                "resources": [{"mimeType": "audio/mpeg", "uri": uri}],
+            },
+            "title": title,
+            "description": description,
+            "type": "audio",
+        }
+        if image_url:
+            nsdk["icon"] = image_url
+            nsdk["mediaData"]["albumArtURI"] = image_url
+
+        nsdk_xml = html.escape(json.dumps(nsdk, separators=(",", ":")), quote=True)
+        parts = [
+            f"<dc:title>{html.escape(title)}</dc:title>",
+            "<dc:creator>http</dc:creator>",
+            f'<res protocolInfo="{protocol}">{uri}</res>',
+            "<upnp:class>object.item.audioItem</upnp:class>",
+            f"<dc:description>{html.escape(description)}</dc:description>",
+        ]
+        if artist:
+            parts.append(f"<upnp:artist>{html.escape(artist)}</upnp:artist>")
+        if album:
+            parts.append(f"<upnp:album>{html.escape(album)}</upnp:album>")
+        if image_url:
+            parts.append(f"<upnp:icon>{html.escape(image_url)}</upnp:icon>")
+        parts.append(f"<x:x_nuvo_nsdk>{nsdk_xml}</x:x_nuvo_nsdk>")
+
+        return (
+            '<?xml version="1.0"?>'
+            '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+            'xmlns:x="urn:schemas.nuvotechnologies.com">'
+            '<item id="" restricted="1">'
+            f"{''.join(parts)}"
+            "</item></DIDL-Lite>"
+        )
+
     async def async_play_uri(
         self,
         uri: str,
@@ -801,8 +1013,10 @@ class NuvoUpnpZone:
 
         Requires the AU7001 to be fully bound (Zone Active=1). Used by Music
         Assistant and other callers that push a reachable audio stream URL.
-        Optional artist/album/image_url are embedded in CurrentURIMetaData so
-        the renderer (and any NuVo displays) can show now-playing info.
+
+        The AU7001 reads now-playing info from ID3 tags in the audio stream
+        (not from DIDL). When title/artist/album are provided, we proxy the
+        stream and prepend an ID3v2 tag so the Legrand app can display them.
         """
         if not self.active:
             _LOGGER.warning(
@@ -816,8 +1030,12 @@ class NuvoUpnpZone:
             await self.async_stop()
             await asyncio.sleep(0.5)
 
-        ext = uri.rsplit(".", 1)[-1].lower().split("?")[0]
-        if ext == "mp3":
+        play_uri = await self._async_prepare_play_uri(
+            uri, title, artist, album, image_url
+        )
+
+        ext = play_uri.rsplit(".", 1)[-1].lower().split("?")[0]
+        if ext == "mp3" or play_uri.endswith("/stream.mp3"):
             protocol = "http-get:*:audio/mpeg:*"
         elif ext in ("flac",):
             protocol = "http-get:*:audio/flac:*"
@@ -826,61 +1044,63 @@ class NuvoUpnpZone:
         else:
             protocol = "http-get:*:*:*"
 
-        meta_parts = [
-            f"<dc:title>{html.escape(title)}</dc:title>",
-            "<upnp:class>object.item.audioItem.musicTrack</upnp:class>",
-        ]
-        if artist:
-            esc_artist = html.escape(artist)
-            meta_parts.append(f"<upnp:artist>{esc_artist}</upnp:artist>")
-            meta_parts.append(f"<dc:creator>{esc_artist}</dc:creator>")
-        if album:
-            meta_parts.append(f"<upnp:album>{html.escape(album)}</upnp:album>")
-        if image_url and image_url.startswith(("http://", "https://")):
-            meta_parts.append(
-                f"<upnp:albumArtURI>{html.escape(image_url)}</upnp:albumArtURI>"
-            )
-        meta_parts.append(f'<res protocolInfo="{protocol}">{uri}</res>')
-
-        didl = (
-            '<?xml version="1.0"?>'
-            '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
-            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-            'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
-            '<item id="0" parentID="-1" restricted="1">'
-            f"{''.join(meta_parts)}"
-            "</item></DIDL-Lite>"
+        didl = self._build_stream_didl(
+            play_uri, title, artist, album, image_url, protocol
         )
-        _LOGGER.debug("[%s] SetAVTransportURI %s", self._name, uri.split("?")[0])
+        _LOGGER.debug("[%s] SetAVTransportURI %s", self._name, play_uri.split("?")[0])
         if await self._soap(
             UPNP_SERVICE_AVTRANSPORT,
             "SetAVTransportURI",
             {
                 "InstanceID": 0,
-                "CurrentURI": uri,
+                "CurrentURI": play_uri,
                 "CurrentURIMetaData": didl,
             },
             raw_fields=_RAW_SOAP_FIELDS,
         ) is None:
-            _LOGGER.error("[%s] SetAVTransportURI rejected for %s", self._name, uri)
+            _LOGGER.error("[%s] SetAVTransportURI rejected for %s", self._name, play_uri)
+            await self._async_stop_stream_proxy()
             return False
 
         if await self._soap(
             UPNP_SERVICE_AVTRANSPORT, "Play", {"InstanceID": 0, "Speed": 1}
         ) is None:
             _LOGGER.error("[%s] Play rejected after SetAVTransportURI", self._name)
+            await self._async_stop_stream_proxy()
             return False
+
+        # Optimistic HA entity state until the device finishes reading ID3.
+        self.media_title = title
+        self.media_artist = artist
+        self.media_album = album
+        if image_url:
+            self.media_image_url = image_url
 
         for _ in range(6):
             await self.async_update()
             if self.state in ("playing", "paused"):
+                # Prefer device-parsed ID3, but keep our values if firmware
+                # has not published them yet.
+                if self._stream_metadata:
+                    self.media_title = self.media_title or self._stream_metadata.get(
+                        "title"
+                    )
+                    self.media_artist = self.media_artist or self._stream_metadata.get(
+                        "artist"
+                    )
+                    self.media_album = self.media_album or self._stream_metadata.get(
+                        "album"
+                    )
+                    self.media_image_url = (
+                        self.media_image_url
+                        or self._stream_metadata.get("image_url")
+                    )
                 return True
             await asyncio.sleep(1)
 
-        # Device often reports nuvo metadata while HTTP is playing; Play succeeded.
         _LOGGER.warning(
             "[%s] Stream started but transport still idle; check AU7001 can reach %s",
             self._name,
-            uri.split("/")[2] if "://" in uri else uri,
+            play_uri.split("/")[2] if "://" in play_uri else play_uri,
         )
         return True

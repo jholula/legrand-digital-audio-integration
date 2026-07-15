@@ -51,6 +51,17 @@ def _stream_image_url(metadata: dict, extra: dict) -> str | None:
     return None
 
 
+def _meta_text(value) -> str | None:
+    """Normalize Music Assistant metadata fields (str or list) to a string."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value if part]
+        return ", ".join(parts) if parts else None
+    text = str(value).strip()
+    return text or None
+
+
 def _au7000_device_info(device_id: str) -> DeviceInfo:
     """Device registry entry for the AU7000 distribution module."""
     return DeviceInfo(
@@ -649,14 +660,15 @@ class LegrandNuvoZone(MediaPlayerEntity):
         if media_id.startswith(("http://", "https://")):
             extra = kwargs.get("extra") or {}
             metadata = extra.get("metadata") or {}
-            title = (
+            title = _meta_text(
                 metadata.get("title")
                 or extra.get("title")
                 or kwargs.get("media_title")
-                or "Stream"
+            ) or "Stream"
+            artist = _meta_text(metadata.get("artist"))
+            album = _meta_text(
+                metadata.get("album") or metadata.get("albumName")
             )
-            artist = metadata.get("artist")
-            album = metadata.get("album") or metadata.get("albumName")
             image_url = _stream_image_url(metadata, extra)
             _LOGGER.info(
                 "Playing stream on %s from %s (title=%s artist=%s)",
