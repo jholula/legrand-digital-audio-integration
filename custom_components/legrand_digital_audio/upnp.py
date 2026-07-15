@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import socket
+import time
 from dataclasses import dataclass, field
 from xml.etree import ElementTree
 from urllib.parse import urlsplit
@@ -45,7 +46,12 @@ REQUEST_TIMEOUT = 10
 SSDP_TIMEOUT = 2.0
 # Zone Get failures before marking the entity unavailable. AVTransport /
 # RenderingControl blips during Music Assistant stream start must not do this.
-ZONE_FAILURES_BEFORE_UNAVAILABLE = 3
+ZONE_FAILURES_BEFORE_UNAVAILABLE = 6
+# After SetAVTransportURI / SSDP port moves, Zone SOAP is often down for tens of
+# seconds while the AU7001 restarts its UPnP stack. Keep the HA entity available.
+STREAM_AVAILABLE_GRACE = 60.0
+REDISCOVER_ATTEMPTS = 3
+REDISCOVER_DELAY = 1.0
 NUVO_NS = "urn:schemas.nuvotechnologies.com"
 DMS_ARGUMENTS = json.dumps(
     {"dms": {"id": "home-assistant", "title": "Home Assistant"}}
@@ -225,6 +231,7 @@ class NuvoUpnpZone:
         self._available = False
         self._zone_failures = 0
         self._rediscovering = False
+        self._hold_available_until = 0.0
 
         # Polled state.
         self.state = "idle"  # idle | playing | paused
@@ -322,6 +329,35 @@ class NuvoUpnpZone:
             _LOGGER.info("[%s] Location updated: %s → %s", self._name, self._location, location)
             self._location = location
             self._base = None  # force re-resolve of control URLs
+            # Port churn means Zone Get will fail briefly; do not flap available.
+            self._hold_available()
+
+    def _hold_available(self, seconds: float = STREAM_AVAILABLE_GRACE) -> None:
+        """Keep the entity available through known UPnP stack resets."""
+        until = time.monotonic() + seconds
+        if until > self._hold_available_until:
+            self._hold_available_until = until
+        self._available = True
+        self._zone_failures = 0
+
+    def _note_zone_failure(self) -> None:
+        """Count a Zone Get failure toward unavailable, with stream grace."""
+        if time.monotonic() < self._hold_available_until:
+            _LOGGER.debug(
+                "[%s] Zone Get failed during availability grace; keeping available",
+                self._name,
+            )
+            return
+        # An active ID3 proxy means Music Assistant audio is still flowing.
+        if self._stream_proxy is not None:
+            _LOGGER.debug(
+                "[%s] Zone Get failed while stream proxy is active; keeping available",
+                self._name,
+            )
+            return
+        self._zone_failures += 1
+        if self._zone_failures >= ZONE_FAILURES_BEFORE_UNAVAILABLE:
+            self._available = False
 
     async def async_close(self):
         """Release browse state (no persistent socket for UPnP)."""
@@ -382,22 +418,32 @@ class NuvoUpnpZone:
             return False
         self._rediscovering = True
         try:
-            devices = await self._hass.async_add_executor_job(_ssdp_discover_au7001)
             host = self.host
             udn = (self._udn or "").lower()
-            match = None
-            for device in devices:
-                device_udn = (device.get("udn") or "").lower()
-                if udn and device_udn and device_udn == udn:
-                    match = device
-                    break
-                if host and device.get("host") == host:
-                    match = device
-            if not match:
-                _LOGGER.debug("[%s] SSDP rediscovery found no matching AU7001", self._name)
-                return False
-            self.update_location(match["location"])
-            return await self._async_resolve()
+            for attempt in range(REDISCOVER_ATTEMPTS):
+                devices = await self._hass.async_add_executor_job(
+                    _ssdp_discover_au7001
+                )
+                match = None
+                for device in devices:
+                    device_udn = (device.get("udn") or "").lower()
+                    if udn and device_udn and device_udn == udn:
+                        match = device
+                        break
+                    if host and device.get("host") == host:
+                        match = device
+                if match:
+                    self.update_location(match["location"])
+                    if await self._async_resolve():
+                        return True
+                if attempt + 1 < REDISCOVER_ATTEMPTS:
+                    await asyncio.sleep(REDISCOVER_DELAY)
+            _LOGGER.debug(
+                "[%s] SSDP rediscovery found no matching AU7001 after %s attempts",
+                self._name,
+                REDISCOVER_ATTEMPTS,
+            )
+            return False
         finally:
             self._rediscovering = False
 
@@ -746,9 +792,7 @@ class NuvoUpnpZone:
             if await self._async_rediscover_location():
                 zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
         if zone is None:
-            self._zone_failures += 1
-            if self._zone_failures >= ZONE_FAILURES_BEFORE_UNAVAILABLE:
-                self._available = False
+            self._note_zone_failure()
             return False
         self._zone_failures = 0
         self._apply_zone_get(zone)
@@ -784,31 +828,12 @@ class NuvoUpnpZone:
     # ------------------------------------------------------------------
     # State polling
     # ------------------------------------------------------------------
-    async def async_update(self):
-        """Refresh all polled state from the device.
+    async def _async_refresh_transport(self) -> None:
+        """Best-effort transport/volume/mute/position refresh.
 
-        Zone Get is the availability heartbeat. Transport/volume/mute/position
-        are best-effort — failures during Music Assistant stream start are
-        common and must not take the entity offline.
+        Used after Music Assistant stream start so confirmation polling does not
+        hammer Zone Get (and mark the entity unavailable) while UPnP restarts.
         """
-        was_available = self._available
-        zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
-        if zone is None:
-            if await self._async_rediscover_location():
-                zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
-        if zone is None:
-            self._zone_failures += 1
-            if self._zone_failures >= ZONE_FAILURES_BEFORE_UNAVAILABLE:
-                self._available = False
-            return
-
-        self._zone_failures = 0
-        self._apply_zone_get(zone)
-        if not was_available and not self.active:
-            # Power-loss capture: Active often returns within a few seconds
-            # with no SOAP bind traffic. Wait briefly before declaring unbound.
-            self._hass.async_create_task(self._async_wait_for_active())
-
         transport = await self._soap(
             UPNP_SERVICE_AVTRANSPORT, "GetTransportInfo", {"InstanceID": 0}
         )
@@ -818,6 +843,14 @@ class NuvoUpnpZone:
                 self.state = "playing"
             elif tstate == "PAUSED_PLAYBACK":
                 self.state = "paused"
+            elif (
+                self._stream_proxy is not None
+                or time.monotonic() < self._hold_available_until
+            ):
+                # UPnP often reports STOPPED/TRANSITIONING during the port reset
+                # even though the HTTP stream is already playing.
+                if self.state not in ("playing", "paused"):
+                    self.state = "playing"
             else:
                 self.state = "idle"
 
@@ -837,6 +870,33 @@ class NuvoUpnpZone:
         if mute:
             self.is_muted = mute.get("CurrentMute") in ("1", "true", "True")
 
+    async def async_update(self):
+        """Refresh all polled state from the device.
+
+        Zone Get is the availability heartbeat. Transport/volume/mute/position
+        are best-effort — failures during Music Assistant stream start are
+        common and must not take the entity offline.
+        """
+        was_available = self._available
+        zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if zone is None:
+            if await self._async_rediscover_location():
+                zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if zone is None:
+            self._note_zone_failure()
+            # Still try transport so now-playing can recover on the new port.
+            await self._async_refresh_transport()
+            return
+
+        self._zone_failures = 0
+        self._apply_zone_get(zone)
+        if not was_available and not self.active:
+            # Power-loss capture: Active often returns within a few seconds
+            # with no SOAP bind traffic. Wait briefly before declaring unbound.
+            self._hass.async_create_task(self._async_wait_for_active())
+
+        await self._async_refresh_transport()
+
         position = await self._soap(
             UPNP_SERVICE_AVTRANSPORT, "GetPositionInfo", {"InstanceID": 0}
         )
@@ -851,15 +911,22 @@ class NuvoUpnpZone:
         Pandora/NuVo put the service name in dc:creator (e.g. "pandora") and
         the real performer in upnp:artist / x_nuvo_nsdk.metaData — prefer those.
         """
-        self.media_title = None
-        self.media_artist = None
-        self.media_album = None
-        self.media_image_url = None
         if not didl or not didl.strip():
+            # Keep Music Assistant / stream-proxy metadata when the device
+            # has not published DIDL yet (common right after SetAVTransportURI).
+            if self._stream_metadata:
+                self.media_title = self._stream_metadata.get("title")
+                self.media_artist = self._stream_metadata.get("artist")
+                self.media_album = self._stream_metadata.get("album")
+                self.media_image_url = self._stream_metadata.get("image_url")
             return
         root = _parse_didl(didl)
         if root is None:
             return
+        self.media_title = None
+        self.media_artist = None
+        self.media_album = None
+        self.media_image_url = None
 
         title = None
         artist = None
@@ -917,6 +984,15 @@ class NuvoUpnpZone:
             self.media_image_url = image
         elif isinstance(nsdk_icon, str) and nsdk_icon.startswith("http"):
             self.media_image_url = nsdk_icon
+
+        # Fill gaps from the stream we pushed (Music Assistant metadata).
+        if self._stream_metadata:
+            self.media_title = self.media_title or self._stream_metadata.get("title")
+            self.media_artist = self.media_artist or self._stream_metadata.get("artist")
+            self.media_album = self.media_album or self._stream_metadata.get("album")
+            self.media_image_url = self.media_image_url or self._stream_metadata.get(
+                "image_url"
+            )
 
     # ------------------------------------------------------------------
     # Transport commands
@@ -1177,14 +1253,19 @@ class NuvoUpnpZone:
             return False
 
         # Optimistic HA entity state until the device finishes reading ID3.
+        # Stream start routinely resets the AU7001 UPnP HTTP port; hold
+        # availability and avoid Zone Get confirmation polling so the native
+        # media_player does not flap unavailable while Music Assistant plays.
+        self.state = "playing"
         self.media_title = title
         self.media_artist = artist
         self.media_album = album
         if image_url:
             self.media_image_url = image_url
+        self._hold_available()
 
         for _ in range(6):
-            await self.async_update()
+            await self._async_refresh_transport()
             if self.state in ("playing", "paused"):
                 # Prefer device-parsed ID3, but keep our values if firmware
                 # has not published them yet.
@@ -1210,4 +1291,6 @@ class NuvoUpnpZone:
             self._name,
             play_uri.split("/")[2] if "://" in play_uri else play_uri,
         )
+        # Keep optimistic playing — audio often starts after the UPnP blip.
+        self.state = "playing"
         return True

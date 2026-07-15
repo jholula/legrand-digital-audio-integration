@@ -543,6 +543,19 @@ class LegrandNuvoZone(MediaPlayerEntity):
         return self._zone.media_album
 
     @property
+    def media_content_type(self):
+        """Return content type so Lovelace shows artist under the title.
+
+        Home Assistant's media cards only render media_artist when
+        media_content_type is "music" (see computeMediaDescription). Pandora
+        and other on-device sources never go through play_media, so without
+        this the card shows title + art but hides the artist.
+        """
+        if self._zone.media_title or self._zone.media_artist or self._zone.media_album:
+            return MediaType.MUSIC
+        return getattr(self, "_attr_media_content_type", None)
+
+    @property
     def media_image_url(self):
         return self._zone.media_image_url
 
