@@ -495,6 +495,7 @@ class LegrandNuvoZone(MediaPlayerEntity):
                         media_content_id=item.object_id,
                         media_content_type=MediaType.MUSIC,
                         can_play=True,
+                        can_expand=False,
                     )
                 )
             elif item.is_container:
@@ -504,6 +505,7 @@ class LegrandNuvoZone(MediaPlayerEntity):
                         media_class=MediaClass.DIRECTORY,
                         media_content_id=item.object_id,
                         media_content_type=MediaType.URL,
+                        can_play=False,
                         can_expand=True,
                     )
                 )
@@ -514,6 +516,7 @@ class LegrandNuvoZone(MediaPlayerEntity):
             media_content_id=result.object_id,
             media_content_type=MediaType.URL,
             children=children,
+            can_play=False,
             can_expand=True,
         )
 
