@@ -170,6 +170,10 @@ class NuvoUpnpZone:
         # Polled state.
         self.state = "idle"  # idle | playing | paused
         self.active = False
+        self.connecting = False
+        self.system_id: str | None = None
+        self.member_id: str | None = None
+        self.zone_title: str | None = None
         self.volume_level: float | None = None
         self.is_muted = False
         self.media_title: str | None = None
@@ -186,6 +190,7 @@ class NuvoUpnpZone:
         self._queue_id: str | None = None
         self._browse_context: NuvoBrowseResult | None = None
         self._items_by_id: dict[str, NuvoBrowseItem] = {}
+        self._waiting_for_active = False
 
     @property
     def available(self) -> bool:
@@ -195,6 +200,39 @@ class NuvoUpnpZone:
     def is_active(self) -> bool:
         """True when the AU7001 is fully bound (Zone Active=1)."""
         return self.active
+
+    @property
+    def bind_status(self) -> str:
+        """Human-readable bind state for entity attributes / diagnostics."""
+        if not self._available:
+            return "unavailable"
+        if self.active:
+            return "bound"
+        if self.connecting:
+            return "connecting"
+        if self.system_id:
+            return "awaiting_button"
+        return "unbound"
+
+    @property
+    def bind_hint(self) -> str:
+        """Short guidance for the current bind_status."""
+        status = self.bind_status
+        if status == "bound":
+            return "Bound (Active=1). Streaming is available."
+        if status == "connecting":
+            return "Bind in progress. If prompted, press the AU7001 bind button."
+        if status == "awaiting_button":
+            return (
+                "System ID created. Press the physical bind button on the AU7001 "
+                "until the LED is solid white."
+            )
+        if status == "unbound":
+            return (
+                "Not bound. Use Start bind (or the Digital Audio app), then press "
+                "the AU7001 bind button until the LED is solid white."
+            )
+        return "AU7001 is unreachable. Check power and network."
 
     @property
     def udn(self) -> str:
@@ -528,21 +566,132 @@ class NuvoUpnpZone:
         return False
 
     # ------------------------------------------------------------------
-    # State polling
+    # Bind helpers (captured from Digital Audio app + button)
     # ------------------------------------------------------------------
-    async def async_update(self):
-        """Refresh all polled state from the device."""
-        zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
-        if zone is None:
-            return
-
+    def _apply_zone_get(self, zone: dict[str, str]) -> None:
+        """Apply Zone Get / SystemCreate fields to polled state."""
         self._available = True
         self.power_state = zone.get("PowerState")
         self.model = zone.get("Model")
         self.active = zone.get("Active") == "1"
+        self.connecting = zone.get("Connecting") == "1"
+        system_id = (zone.get("SystemID") or "").strip()
+        self.system_id = system_id or None
+        member_id = (zone.get("MemberID") or "").strip()
+        self.member_id = member_id or None
+        title = (zone.get("Title") or "").strip()
+        self.zone_title = title or None
         self.group_id = _parse_group_id(zone.get("MasterGroup"))
         if not self.active:
             self._queue_id = None
+
+    async def async_system_create(self) -> str | None:
+        """Create a new NuVo system ID (app Bind Digital Source step).
+
+        Mirrors the Digital Audio app SOAP call:
+        Zone#SystemCreate with an empty primaryGwMac. Returns the new SystemID
+        on success, or None on failure. Does not complete bind by itself —
+        Active=1 still requires the physical AU7001 bind button.
+        """
+        resp = await self._soap(
+            NUVO_SERVICE_ZONE,
+            "SystemCreate",
+            {"primaryGwMac": ""},
+        )
+        if resp is None:
+            return None
+        new_id = (resp.get("newSystemID") or "").strip()
+        if new_id:
+            self.system_id = new_id
+        await self.async_update_zone_only()
+        return self.system_id
+
+    async def async_attempt_bind(self) -> dict[str, str | bool | None]:
+        """Start the software half of bind; report what the user must do next."""
+        await self.async_update_zone_only()
+        if self.active:
+            return {
+                "status": "already_bound",
+                "system_id": self.system_id,
+                "message": self.bind_hint,
+            }
+
+        new_id = await self.async_system_create()
+        if new_id is None and not self.system_id:
+            return {
+                "status": "failed",
+                "system_id": None,
+                "message": (
+                    "SystemCreate failed. Confirm the AU7001 is online, then retry "
+                    "or use Bind Digital Source in the Digital Audio app."
+                ),
+            }
+
+        await self.async_update_zone_only()
+        if self.active:
+            return {
+                "status": "bound",
+                "system_id": self.system_id,
+                "message": self.bind_hint,
+            }
+        return {
+            "status": "press_button",
+            "system_id": self.system_id,
+            "message": self.bind_hint,
+        }
+
+    async def async_update_zone_only(self) -> bool:
+        """Refresh Zone Get bind fields without transport/volume polling."""
+        zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if zone is None:
+            self._available = False
+            return False
+        self._apply_zone_get(zone)
+        return True
+
+    async def _async_wait_for_active(self, attempts: int = 8, delay: float = 1.0):
+        """Poll briefly after reconnect; firmware often restores Active itself."""
+        if self._waiting_for_active:
+            return
+        self._waiting_for_active = True
+        try:
+            for _ in range(attempts):
+                if self.active or not self._available:
+                    return
+                await asyncio.sleep(delay)
+                await self.async_update_zone_only()
+                if self.active:
+                    _LOGGER.info(
+                        "[%s] Bind restored after reconnect (SystemID=%s)",
+                        self._name,
+                        self.system_id,
+                    )
+                    return
+            if not self.active:
+                _LOGGER.warning(
+                    "[%s] Still unbound after reconnect: %s",
+                    self._name,
+                    self.bind_hint,
+                )
+        finally:
+            self._waiting_for_active = False
+
+    # ------------------------------------------------------------------
+    # State polling
+    # ------------------------------------------------------------------
+    async def async_update(self):
+        """Refresh all polled state from the device."""
+        was_available = self._available
+        zone = await self._soap(NUVO_SERVICE_ZONE, "Get")
+        if zone is None:
+            self._available = False
+            return
+
+        self._apply_zone_get(zone)
+        if not was_available and not self.active:
+            # Power-loss capture: Active often returns within a few seconds
+            # with no SOAP bind traffic. Wait briefly before declaring unbound.
+            self._hass.async_create_task(self._async_wait_for_active())
 
         transport = await self._soap(
             UPNP_SERVICE_AVTRANSPORT, "GetTransportInfo", {"InstanceID": 0}
@@ -639,11 +788,21 @@ class NuvoUpnpZone:
             {"InstanceID": 0, "Channel": "Master", "DesiredMute": 1 if mute else 0},
         )
 
-    async def async_play_uri(self, uri: str, title: str = "Stream") -> bool:
+    async def async_play_uri(
+        self,
+        uri: str,
+        title: str = "Stream",
+        *,
+        artist: str | None = None,
+        album: str | None = None,
+        image_url: str | None = None,
+    ) -> bool:
         """Stream an HTTP/HTTPS URL via standard DLNA SetAVTransportURI.
 
         Requires the AU7001 to be fully bound (Zone Active=1). Used by Music
         Assistant and other callers that push a reachable audio stream URL.
+        Optional artist/album/image_url are embedded in CurrentURIMetaData so
+        the renderer (and any NuVo displays) can show now-playing info.
         """
         if not self.active:
             _LOGGER.warning(
@@ -667,15 +826,29 @@ class NuvoUpnpZone:
         else:
             protocol = "http-get:*:*:*"
 
+        meta_parts = [
+            f"<dc:title>{html.escape(title)}</dc:title>",
+            "<upnp:class>object.item.audioItem.musicTrack</upnp:class>",
+        ]
+        if artist:
+            esc_artist = html.escape(artist)
+            meta_parts.append(f"<upnp:artist>{esc_artist}</upnp:artist>")
+            meta_parts.append(f"<dc:creator>{esc_artist}</dc:creator>")
+        if album:
+            meta_parts.append(f"<upnp:album>{html.escape(album)}</upnp:album>")
+        if image_url and image_url.startswith(("http://", "https://")):
+            meta_parts.append(
+                f"<upnp:albumArtURI>{html.escape(image_url)}</upnp:albumArtURI>"
+            )
+        meta_parts.append(f'<res protocolInfo="{protocol}">{uri}</res>')
+
         didl = (
             '<?xml version="1.0"?>'
             '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
             'xmlns:dc="http://purl.org/dc/elements/1.1/" '
             'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
             '<item id="0" parentID="-1" restricted="1">'
-            f"<dc:title>{html.escape(title)}</dc:title>"
-            "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
-            f'<res protocolInfo="{protocol}">{uri}</res>'
+            f"{''.join(meta_parts)}"
             "</item></DIDL-Lite>"
         )
         _LOGGER.debug("[%s] SetAVTransportURI %s", self._name, uri.split("?")[0])

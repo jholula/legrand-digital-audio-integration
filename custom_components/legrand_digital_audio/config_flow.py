@@ -212,7 +212,9 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._ssdp_location = location
         self._ssdp_udn = udn
         self._ssdp_name = friendly
-        self.context["title_placeholders"] = {"name": friendly}
+        self.context["title_placeholders"] = {
+            "host": self._host_from_location(location),
+        }
         await self._async_discover_devices()
         return await self.async_step_ssdp_confirm()
 

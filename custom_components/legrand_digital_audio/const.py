@@ -42,3 +42,6 @@ DEFAULT_DEVICE_NAME_AU7000 = "Legrand Distribution Module"
 DEFAULT_DEVICE_NAME_AU7001 = "Legrand Digital Audio Module"
 DEFAULT_ENTRY_TITLE_AU7000 = "Legrand Distribution Module (AU7000)"
 DEFAULT_ENTRY_TITLE_AU7001 = "Legrand Digital Audio Module (AU7001)"
+
+# Entity service: software half of AU7001 bind (Zone#SystemCreate).
+SERVICE_ATTEMPT_BIND = "attempt_bind"

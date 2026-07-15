@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import timedelta
 
 from homeassistant.components.media_player import (
     BrowseError,
@@ -10,10 +11,10 @@ from homeassistant.components.media_player import (
     MediaPlayerState,
     MediaType,
 )
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.device_registry import CONNECTION_UPNP
 from homeassistant.helpers.entity import DeviceInfo
 
-from datetime import timedelta
 from .const import (
     CONF_DEVICE_TYPE,
     DEFAULT_DEVICE_NAME_AU7000,
@@ -22,6 +23,7 @@ from .const import (
     DEVICE_TYPE_AU7001,
     DOMAIN,
     NUVO_BROWSE_ROOT,
+    SERVICE_ATTEMPT_BIND,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,6 +31,24 @@ _LOGGER = logging.getLogger(__name__)
 SCAN_INTERVAL = timedelta(seconds=10)
 
 ALL_KEY = "all"
+
+
+def _stream_image_url(metadata: dict, extra: dict) -> str | None:
+    """Pick an HTTP(S) art URL from Music Assistant / Cast-style extras."""
+    for key in ("imageUrl", "image_url", "albumArtURI", "thumb"):
+        value = metadata.get(key) or extra.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+    images = metadata.get("images")
+    if isinstance(images, list):
+        for entry in images:
+            if isinstance(entry, dict):
+                url = entry.get("url")
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    return url
+            elif isinstance(entry, str) and entry.startswith(("http://", "https://")):
+                return entry
+    return None
 
 
 def _au7000_device_info(device_id: str) -> DeviceInfo:
@@ -48,6 +68,12 @@ async def async_setup_entry(hass, config, async_add_entities) -> None:
 
     if entry_data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_AU7001:
         async_add_entities([LegrandNuvoZone(entry_data["upnp"], config.entry_id)])
+        platform = entity_platform.async_get_current_platform()
+        platform.async_register_entity_service(
+            SERVICE_ATTEMPT_BIND,
+            {},
+            "async_attempt_bind",
+        )
         return
 
     connection = entry_data["connection"]
@@ -376,6 +402,40 @@ class LegrandDigitalAudio(MediaPlayerEntity):
                 return
 
 
+async def _async_dim_connecting(hass, udn: str) -> bool | None:
+    """Return AU7000 DIM Connecting for this UDN, if an AU7000 entry exists."""
+    domain_data = hass.data.get(DOMAIN) or {}
+    for entry_data in domain_data.values():
+        if not isinstance(entry_data, dict):
+            continue
+        if entry_data.get(CONF_DEVICE_TYPE) != DEVICE_TYPE_AU7000:
+            continue
+        connection = entry_data.get("connection")
+        if connection is None:
+            continue
+        # Use a high ID so we do not collide with zone media_player command IDs.
+        response = await connection.send(
+            json.dumps({"ID": 91001, "Service": "ListSources"})
+        )
+        if not isinstance(response, dict):
+            return None
+        sources = response.get("SourceList") or []
+        want = udn.lower().replace("-", "")
+        if want.startswith("uuid:"):
+            want = want[5:]
+        for source in sources:
+            if source.get("Type") != "DIM1":
+                continue
+            upnp_id = str(source.get("UPnP ID") or "").lower().replace("-", "")
+            if want and want not in upnp_id and upnp_id not in want:
+                continue
+            return bool(source.get("Connecting"))
+        for source in sources:
+            if source.get("Type") == "DIM1":
+                return bool(source.get("Connecting"))
+    return None
+
+
 class LegrandNuvoZone(MediaPlayerEntity):
     """An AU7001 streaming zone controlled over UPnP.
 
@@ -393,6 +453,7 @@ class LegrandNuvoZone(MediaPlayerEntity):
         """Initialize the AU7001 streaming zone entity."""
         self._zone = zone
         self._entry_id = entry_id
+        self._dim_connecting: bool | None = None
         self._attr_name = DEFAULT_DEVICE_NAME_AU7001
         self._attr_unique_id = f"{DOMAIN}_{zone.udn}"
         self._attr_suggested_object_id = "legrand_digital_audio_module"
@@ -409,11 +470,41 @@ class LegrandNuvoZone(MediaPlayerEntity):
     async def async_update(self):
         """Poll the device for its latest state."""
         await self._zone.async_update()
+        self._dim_connecting = await _async_dim_connecting(self.hass, self._zone.udn)
+
+    async def async_attempt_bind(self) -> None:
+        """Entity service: run SystemCreate, then ask the user to press the button."""
+        result = await self._zone.async_attempt_bind()
+        _LOGGER.info(
+            "attempt_bind on %s → %s (SystemID=%s): %s",
+            self.name,
+            result.get("status"),
+            result.get("system_id"),
+            result.get("message"),
+        )
+        self.async_write_ha_state()
 
     @property
     def available(self):
         """Return True when the device is reachable."""
         return self._zone.available
+
+    @property
+    def extra_state_attributes(self):
+        """Expose bind health for diagnostics and automations."""
+        attrs = {
+            "bind_status": self._zone.bind_status,
+            "bind_hint": self._zone.bind_hint,
+            "active": self._zone.active,
+            "connecting": self._zone.connecting,
+            "system_id": self._zone.system_id,
+            "member_id": self._zone.member_id,
+            "zone_title": self._zone.zone_title,
+            "host": self._zone.host,
+        }
+        if self._dim_connecting is not None:
+            attrs["dim_connecting"] = self._dim_connecting
+        return attrs
 
     @property
     def state(self):
@@ -564,22 +655,34 @@ class LegrandNuvoZone(MediaPlayerEntity):
                 or kwargs.get("media_title")
                 or "Stream"
             )
+            artist = metadata.get("artist")
+            album = metadata.get("album") or metadata.get("albumName")
+            image_url = _stream_image_url(metadata, extra)
             _LOGGER.info(
-                "Playing stream on %s from %s",
+                "Playing stream on %s from %s (title=%s artist=%s)",
                 self.name,
                 media_id.split("?")[0][:120],
+                title,
+                artist or "-",
             )
-            if await self._zone.async_play_uri(media_id, title=title):
+            if await self._zone.async_play_uri(
+                media_id,
+                title=title,
+                artist=artist,
+                album=album,
+                image_url=image_url,
+            ):
                 self._attr_media_content_id = media_id
                 self._attr_media_content_type = media_type or "music"
+                # Keep HA entity metadata even if the AU7001 reports NuVo DIDL.
                 if title:
                     self._zone.media_title = title
-                artist = metadata.get("artist")
                 if artist:
                     self._zone.media_artist = artist
-                album = metadata.get("album") or metadata.get("albumName")
                 if album:
                     self._zone.media_album = album
+                if image_url:
+                    self._zone.media_image_url = image_url
                 self.async_write_ha_state()
             else:
                 _LOGGER.error("Failed to stream URL on %s", self.name)

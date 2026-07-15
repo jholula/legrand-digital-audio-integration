@@ -19,7 +19,7 @@ from .const import (
 from .connection import LegrandConnection
 from .upnp import NuvoUpnpZone
 
-PLATFORMS = [Platform.MEDIA_PLAYER]
+PLATFORMS = [Platform.MEDIA_PLAYER, Platform.BUTTON]
 _LOGGER = logging.getLogger(__name__)
 
 
