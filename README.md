@@ -6,9 +6,35 @@
 [![GitHub Release][releases-shield]][releases]
 [![License][license-shield]](LICENSE)
 
-Control Legrand / NuVo Digital Audio systems from Home Assistant — whole-house zones (**AU7000**) and streaming modules (**AU7001**).
+Control Legrand / NuVo Digital Audio systems from Home Assistant — whole-house zones (**AU7000**) and streaming modules (**AU7001**). Automate speakers with automations, scripts, scenes, and dashboards; no Digital Audio app required for day-to-day control.
 
-You can **automate your speakers in Home Assistant**: turn zones on and off, change sources, adjust volume, and mute — individually or across all zones — with automations, scripts, scenes, and dashboards. No Digital Audio app required for day-to-day control.
+## Table of contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Binding the AU7001](#binding-the-au7001)
+- [Automations](#automations)
+- [Examples](#examples)
+  - [AU7000 zone dashboard](#au7000-zone-dashboard)
+  - [AU7001 in Home Assistant](#au7001-in-home-assistant)
+  - [Music Assistant to AU7001](#music-assistant-to-au7001)
+- [Support](#support)
+
+## Features
+
+### AU7000 — distribution module
+
+- Control multiple audio zones (plus an “all zones” entity)
+- Power on/off, volume, mute, and source selection
+- Full Home Assistant automation: schedules, presence, voice assistants, scenes, and scripts
+
+### AU7001 — streaming module
+
+- Media player for Pandora browse and other onboard services
+- Music Assistant (and other) HTTP stream playback with title, artist, album, and artwork on the module / keypads (via an ID3 stream proxy)
+- **Start bind** button + `attempt_bind` service (replaces Bind Digital Source in the app)
+- Bind status attributes for diagnostics
 
 ## Installation
 
@@ -34,7 +60,7 @@ You can **automate your speakers in Home Assistant**: turn zones on and off, cha
 
 Most installs add both: the AU7000 for zone power/volume/source, and the AU7001 for streaming (browse, Music Assistant, etc.).
 
-## Binding the AU7001 (Digital Audio app no longer required)
+## Binding the AU7001
 
 Previously you had to use the Legrand **Digital Audio** app (Settings → **Bind Digital Source**) and press the physical bind button on the AU7001. That app step is **no longer needed**:
 
@@ -50,27 +76,9 @@ You can confirm bind health on the media player entity via attributes such as `b
 
 > Optional: the Digital Audio app can still be used to sign in to Pandora / Spotify if you want those services in the onboard browser. Day-to-day zone control and Music Assistant streaming do not require the app.
 
-## Features
-
-### AU7000 — distribution module
-
-- Control multiple audio zones (plus an “all zones” entity)
-- Power on/off
-- Volume control
-- Source selection (change what each zone is playing)
-- Mute/unmute
-- Full Home Assistant automation: schedules, presence, voice assistants, scenes, and scripts
-
-### AU7001 — streaming module
-
-- Media player for Pandora browse / local streaming
-- Music Assistant (and other) HTTP stream playback with title, artist, album, and artwork shown on the module / keypads (via an ID3 stream proxy)
-- **Start bind** button + `attempt_bind` service (replaces Bind Digital Source in the app)
-- Bind status attributes for diagnostics
-
 ## Automations
 
-Each zone is a standard Home Assistant **media player**, so you can drive speakers without the Digital Audio app:
+Each zone is a standard Home Assistant **media player**:
 
 - Turn zones **on/off** (including an all-zones entity)
 - **Change source** per zone (or all zones)
@@ -79,11 +87,17 @@ Each zone is a standard Home Assistant **media player**, so you can drive speake
 
 Example: turn on the kitchen zone and select a source when someone arrives home, or power everything off at bedtime with a single automation.
 
-## Home Assistant — Dashboard Examples
+## Examples
 
-Below you can find some examples of usage of this custom component using a media player card within a bubble card.
+Jump to a gallery:
 
-### Entities in dashboard as media player cards
+- [AU7000 zone dashboard](#au7000-zone-dashboard)
+- [AU7001 in Home Assistant](#au7001-in-home-assistant)
+- [Music Assistant to AU7001](#music-assistant-to-au7001)
+
+### AU7000 zone dashboard
+
+Media player cards (bubble card) for whole-house zones:
 
 ![dashboard_1](examples/dashboard_1.png)
 
@@ -91,9 +105,9 @@ Each zone is given its own entity, with all zones controlling every zone.
 
 ![dashboard_2](examples/dashboard_2.png)
 
-Here you can see zones being turned on, changing of the sources, and changing volume.
+Zones turned on, sources changed, and volume adjusted.
 
-Below is the yaml for these media player cards, using the bubble card add-on.
+YAML for these media player cards (bubble card add-on):
 
 ```yaml
   - type: custom:bubble-card
@@ -226,11 +240,27 @@ Below is the yaml for these media player cards, using the bubble card add-on.
         attribute: source
 ```
 
+### AU7001 in Home Assistant
+
+Browse and play onboard services (for example Pandora) from the AU7001 media player. Now-playing shows in Home Assistant, and the same track appears in the Digital Audio app when a zone is on that source.
+
+![AU7001 playing in Home Assistant](examples/au7001_da_example_dashboard.png)
+
+![AU7001 now playing in the Digital Audio app](examples/au7001_da_example_digital_audio.png)
+
+### Music Assistant to AU7001
+
+Add the AU7001 `media_player` as a **Home Assistant player** in Music Assistant. Streams play on the Legrand Audio Module; metadata is pushed so Home Assistant and the Digital Audio UI show the current track.
+
+![Music Assistant streaming to Legrand Audio Module](examples/au7001_ma_example.png)
+
+![Music Assistant stream in the Home Assistant Sound dashboard](examples/au7001_ma_example_dashboard.png)
+
+![Music Assistant track metadata on the AU7001 / Digital Audio UI](examples/au7001_ma_example_digital_audio.png)
+
 ## Support
 
 For issues and feature requests, please use the [GitHub Issues][issues] page.
-
-
 
 ---
 
