@@ -5,7 +5,11 @@ from homeassistant.components import ssdp
 from homeassistant.components.ssdp import SsdpChange
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import Platform
@@ -22,7 +26,12 @@ from .const import (
     DOMAIN,
     NUVO_ZONE_DEVICE_TYPE,
 )
-from .connection import LegrandConnection
+from .connection import (
+    LegrandAuthRequired,
+    LegrandConnection,
+    LegrandInvalidAuth,
+    LegrandSetKeyRequired,
+)
 from .upnp import NuvoUpnpZone
 
 PLATFORMS = [Platform.MEDIA_PLAYER, Platform.BUTTON]
@@ -114,15 +123,21 @@ async def _async_setup_au7000(hass: HomeAssistant, entry: ConfigEntry) -> None:
         "Setting up %s Legrand Digital Audio zones on %s:%s", len(zones), host, port
     )
 
-    # Establish the shared connection (handshake included). If the device is
-    # unreachable at startup, tell HA to retry setup later instead of failing.
-    connection = LegrandConnection(host, port)
+    # Establish the shared connection (handshake included). Auth failures get
+    # a reauth prompt. Anything else tells HA to retry setup later.
+    connection = LegrandConnection(host, port, entry.data.get("password") or None)
     try:
         await connection.async_connect()
-    except Exception as e:  # noqa: BLE001
+    except (LegrandAuthRequired, LegrandInvalidAuth) as err:
+        raise ConfigEntryAuthFailed(
+            f"Unable to authenticate to Legrand Digital Audio at {host}:{port}: {err}"
+        ) from err
+    except LegrandSetKeyRequired as err:
+        raise ConfigEntryError(str(err)) from err
+    except Exception as err:  # noqa: BLE001
         raise ConfigEntryNotReady(
-            f"Unable to connect to Legrand Digital Audio at {host}:{port}: {e}"
-        ) from e
+            f"Unable to connect to Legrand Digital Audio at {host}:{port}: {err}"
+        ) from err
 
     # `entities` is populated by the media_player platform during setup so that
     # any entity (notably the aggregate "all" entity) can look up its peers and

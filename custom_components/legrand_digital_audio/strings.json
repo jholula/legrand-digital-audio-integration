@@ -11,10 +11,25 @@
             },
             "manual": {
                 "title": "AU7000 — manual setup",
-                "description": "Enter the IP address of your **distribution module (AU7000)**. This is the unit that drives your speaker zones. Port **2112** is used on all known hardware.",
+                "description": "Enter the IP address of your **distribution module (AU7000)**. This is the unit that drives your speaker zones. Port **2112** is used on all known hardware.\n\nIf the module has an 8-character password printed on the front, enter it below. Older modules can leave the password blank.",
                 "data": {
                     "host": "IP address",
-                    "port": "Port"
+                    "port": "Port",
+                    "password": "Password (if printed on the module)"
+                }
+            },
+            "au7000_auth": {
+                "title": "AU7000 password",
+                "description": "The distribution module at **{host}** uses Legrand's secured connection. Enter the 8-character password printed on the sticker on the front of the AU7000. This is the same password the Digital Audio app asks for on first setup.",
+                "data": {
+                    "password": "Password"
+                }
+            },
+            "reauth_confirm": {
+                "title": "Reauthenticate distribution module",
+                "description": "The AU7000 at **{host}** rejected the saved password. Enter the 8-character password printed on the front of the module.",
+                "data": {
+                    "password": "Password"
                 }
             },
             "manual_au7001": {
@@ -42,10 +57,15 @@
         },
         "error": {
             "cannot_connect": "Could not connect to the AU7000 on port 2112. Check the IP address and that the module is powered on.",
-            "cannot_connect_au7001": "Could not find an AU7001 at that IP. Make sure it is powered on and bound (solid white LED)."
+            "cannot_connect_au7001": "Could not find an AU7001 at that IP. Make sure it is powered on and bound (solid white LED).",
+            "invalid_auth": "That password was rejected by the AU7000. Check the sticker on the front of the module.",
+            "auth_required": "This AU7000 requires the password printed on the module.",
+            "setkey_required": "This AU7000 has no password set. Set one in the Legrand app, then try again."
         },
         "abort": {
-            "already_configured": "This device is already configured."
+            "already_configured": "This device is already configured.",
+            "cannot_connect": "Could not connect to the AU7000.",
+            "reauth_successful": "Reauthentication successful."
         }
     },
     "services": {

@@ -60,6 +60,8 @@ Control Legrand / NuVo Digital Audio systems from Home Assistant — whole-house
 
 Most installs add both: the AU7000 for zone power/volume/source, and the AU7001 for streaming (browse, Music Assistant, etc.).
 
+Some newer AU7000 modules require the 8-character password printed on the sticker on the front of the unit (the same password the Digital Audio app asks for). If Home Assistant prompts for it, enter that password. Older modules without a sticker connect without one. If setup says the module has no password set, choose a password in the Legrand app first.
+
 ## Binding the AU7001
 
 Previously you had to use the Legrand **Digital Audio** app (Settings → **Bind Digital Source**) and press the physical bind button on the AU7001. That app step is **no longer needed**:

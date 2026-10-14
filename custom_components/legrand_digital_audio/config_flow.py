@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import socket
@@ -13,6 +12,12 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.helpers.device_registry import format_mac
 
+from .connection import (
+    LegrandAuthRequired,
+    LegrandConnection,
+    LegrandInvalidAuth,
+    LegrandSetKeyRequired,
+)
 from .const import (
     CONF_DEVICE_TYPE,
     DEFAULT_DEVICE_NAME_AU7000,
@@ -55,6 +60,12 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._ssdp_name: str | None = None
         self._companion_offer: dict | None = None
         self._add_companion = False
+        self._password: str | None = None
+        self._pending_host: str | None = None
+        self._pending_port: int = DEFAULT_PORT
+        self._auth_error: str | None = None
+        self._reauth_entry = None
+        self._did_discover = False
 
     # ------------------------------------------------------------------
     # Entry points
@@ -93,29 +104,124 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_manual(self, user_input=None):
         """Manual entry for the AU7000 distribution module."""
         errors: dict[str, str] = {}
-        if user_input is not None:
-            host = user_input["host"]
-            port = user_input["port"]
-            try:
-                self._zones = await self.hass.async_add_executor_job(
-                    self._fetch_zones, host, port
-                )
-            except Exception as e:  # noqa: BLE001
-                _LOGGER.error("Error fetching devices from %s: %s", host, e)
-                errors["base"] = "cannot_connect"
-            else:
-                return await self._async_maybe_offer_companion_au7000(
-                    host, port
-                )
 
+        async def _on_error(error_key: str):
+            errors["base"] = error_key
+            return self._show_manual_form(errors)
+
+        if user_input is not None:
+            host = user_input["host"].strip()
+            port = user_input["port"]
+            password = (user_input.get("password") or "").strip() or None
+            return await self._async_continue_au7000(
+                host, port, password, on_error=_on_error
+            )
+
+        return self._show_manual_form(errors)
+
+    def _show_manual_form(self, errors: dict[str, str]):
         schema = vol.Schema(
             {
                 vol.Required("host"): str,
                 vol.Required("port", default=DEFAULT_PORT): int,
+                vol.Optional("password"): str,
             }
         )
         return self.async_show_form(
             step_id="manual", data_schema=schema, errors=errors
+        )
+
+    async def async_step_au7000_auth(self, user_input=None):
+        """Ask for the factory password printed on a secured AU7000."""
+        if not self._pending_host:
+            return self.async_abort(reason="cannot_connect")
+
+        errors: dict[str, str] = {}
+        if self._auth_error:
+            errors["base"] = self._auth_error
+            self._auth_error = None
+
+        if user_input is not None:
+            password = (user_input.get("password") or "").strip()
+            if not password:
+                errors["base"] = "invalid_auth"
+            else:
+                try:
+                    self._zones, _secure = await self._async_probe_au7000(
+                        self._pending_host, self._pending_port, password
+                    )
+                except LegrandInvalidAuth:
+                    errors["base"] = "invalid_auth"
+                except LegrandAuthRequired:
+                    errors["base"] = "invalid_auth"
+                except LegrandSetKeyRequired:
+                    errors["base"] = "setkey_required"
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.error(
+                        "Error fetching devices from %s: %s",
+                        self._pending_host,
+                        err,
+                    )
+                    errors["base"] = "cannot_connect"
+                else:
+                    self._password = password
+                    return await self._async_maybe_offer_companion_au7000(
+                        self._pending_host, self._pending_port
+                    )
+
+        return self.async_show_form(
+            step_id="au7000_auth",
+            data_schema=vol.Schema({vol.Required("password"): str}),
+            errors=errors,
+            description_placeholders={"host": self._pending_host},
+        )
+
+    async def async_step_reauth(self, entry_data):
+        """Start a reauth flow when a saved AU7000 password is rejected."""
+        self._pending_host = entry_data["host"]
+        self._pending_port = entry_data.get("port", DEFAULT_PORT)
+        self._reauth_entry = self.hass.config_entries.async_get_entry(
+            self.context["entry_id"]
+        )
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None):
+        """Prompt for a replacement AU7000 password and reload the entry."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            password = (user_input.get("password") or "").strip()
+            if not password:
+                errors["base"] = "invalid_auth"
+            else:
+                try:
+                    zones, _secure = await self._async_probe_au7000(
+                        self._pending_host, self._pending_port, password
+                    )
+                except (LegrandInvalidAuth, LegrandAuthRequired):
+                    errors["base"] = "invalid_auth"
+                except LegrandSetKeyRequired:
+                    errors["base"] = "setkey_required"
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.error(
+                        "Error fetching devices from %s: %s",
+                        self._pending_host,
+                        err,
+                    )
+                    errors["base"] = "cannot_connect"
+                else:
+                    entry = self._reauth_entry
+                    new_data = dict(entry.data)
+                    new_data["password"] = password
+                    new_data["zones"] = zones
+                    self.hass.config_entries.async_update_entry(entry, data=new_data)
+                    await self.hass.config_entries.async_reload(entry.entry_id)
+                    return self.async_abort(reason="reauth_successful")
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required("password"): str}),
+            errors=errors,
+            description_placeholders={"host": self._pending_host or ""},
         )
 
     async def async_step_manual_au7001(self, user_input=None):
@@ -174,21 +280,19 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_discovery_confirm(self, user_input=None):
         """Confirm adding a discovered AU7000."""
         errors: dict[str, str] = {}
+
+        async def _on_error(error_key: str):
+            errors["base"] = error_key
+            return self.async_show_form(
+                step_id="discovery_confirm",
+                description_placeholders={"host": self._host},
+                errors=errors,
+            )
+
         if user_input is not None:
-            try:
-                self._zones = await self.hass.async_add_executor_job(
-                    self._fetch_zones, self._host, DEFAULT_PORT
-                )
-            except Exception as e:  # noqa: BLE001
-                _LOGGER.error(
-                    "Error fetching devices from %s: %s", self._host, e
-                )
-                errors["base"] = "cannot_connect"
-            else:
-                await self._async_discover_devices()
-                return await self._async_maybe_offer_companion_au7000(
-                    self._host, DEFAULT_PORT
-                )
+            return await self._async_continue_au7000(
+                self._host, DEFAULT_PORT, on_error=_on_error
+            )
 
         return self.async_show_form(
             step_id="discovery_confirm",
@@ -271,6 +375,7 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._discovered_au7001 = [
             d for d in au7001 if d["udn"] not in configured_udns
         ]
+        self._did_discover = True
 
     def _async_show_device_picker(self, errors=None):
         """Show the unified device picker."""
@@ -299,21 +404,54 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _async_setup_au7000(self, host: str, port: int = DEFAULT_PORT):
         """Validate an AU7000 and continue setup."""
-        try:
-            self._zones = await self.hass.async_add_executor_job(
-                self._fetch_zones, host, port
-            )
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("Error fetching devices from %s: %s", host, e)
-            await self._async_discover_devices()
-            return self._async_show_device_picker(errors={"base": "cannot_connect"})
 
+        async def _on_error(error_key: str):
+            await self._async_discover_devices()
+            return self._async_show_device_picker(errors={"base": error_key})
+
+        return await self._async_continue_au7000(host, port, on_error=_on_error)
+
+    async def _async_continue_au7000(self, host, port, password=None, *, on_error):
+        """Validate an AU7000, prompting for a password when the unit requires one."""
+        self._pending_host = host
+        self._pending_port = port
+        try:
+            zones, secure = await self._async_probe_au7000(host, port, password)
+        except LegrandAuthRequired:
+            return await self.async_step_au7000_auth()
+        except LegrandInvalidAuth:
+            self._auth_error = "invalid_auth"
+            return await self.async_step_au7000_auth()
+        except LegrandSetKeyRequired:
+            _LOGGER.error(
+                "AU7000 at %s has no password set; configure it in the Legrand app",
+                host,
+            )
+            return await on_error("setkey_required")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Error fetching devices from %s: %s", host, err)
+            return await on_error("cannot_connect")
+
+        self._zones = zones
+        self._password = password if secure else None
         return await self._async_maybe_offer_companion_au7000(host, port)
+
+    async def _async_probe_au7000(self, host: str, port: int, password: str | None):
+        """Connect with the shared handshake and return (zones, used_password)."""
+        connection = LegrandConnection(host, port, password)
+        try:
+            await connection.async_connect()
+            zones = await connection.fetch_zones()
+            return zones, connection.used_password
+        finally:
+            await connection.async_close()
 
     async def _async_maybe_offer_companion_au7000(
         self, host: str, port: int = DEFAULT_PORT
     ):
         """After AU7000 validation, offer an AU7001 companion if present."""
+        if not self._did_discover:
+            await self._async_discover_devices()
         primary = {"type": DEVICE_TYPE_AU7000, "host": host, "port": port}
         companion = self._discovered_au7001[0] if self._discovered_au7001 else None
         if companion:
@@ -348,18 +486,24 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured(updates={"host": host})
 
         if self._zones is None:
-            self._zones = await self.hass.async_add_executor_job(
-                self._fetch_zones, host, port
+            self._zones, secure = await self._async_probe_au7000(
+                host, port, self._password
             )
+            if not secure:
+                self._password = None
+
+        data = {
+            CONF_DEVICE_TYPE: DEVICE_TYPE_AU7000,
+            "host": host,
+            "port": port,
+            "zones": self._zones,
+        }
+        if self._password:
+            data["password"] = self._password
 
         result = self.async_create_entry(
             title=DEFAULT_ENTRY_TITLE_AU7000,
-            data={
-                CONF_DEVICE_TYPE: DEVICE_TYPE_AU7000,
-                "host": host,
-                "port": port,
-                "zones": self._zones,
-            },
+            data=data,
         )
         self._schedule_companion_flow()
         return result
@@ -472,7 +616,13 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     sock.connect((ip, DEFAULT_PORT))
                     sock.settimeout(1.0)
                     banner = sock.recv(256)
-                if b"Greeting" in banner or b"Nuvo" in banner:
+                data = banner.lstrip(b"\x00")
+                if (
+                    b"Greeting" in data
+                    or b"Nuvo" in data
+                    or data.startswith(b"Hello V1")
+                    or b'{"ID"' in data
+                ):
                     return ip
             except OSError:
                 return None
@@ -583,40 +733,3 @@ class LegrandDigitalAudioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return None
         finally:
             sock.close()
-
-    def _fetch_zones(self, host: str, port: int):
-        """Fetch all zones from the AU7000 JSON API."""
-        _LOGGER.debug("Fetching zones from %s:%s", host, port)
-
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(FETCH_TIMEOUT)
-            sock.connect((host, port))
-            sock.recv(1024)
-            sock.sendall(
-                (json.dumps({"ID": 3, "Service": "ListSources"}) + "\n").encode()
-            )
-            sources = json.loads(
-                sock.recv(1024).decode("utf-8").replace("\x00", "").strip()
-            )
-            sock.sendall(
-                (json.dumps({"ID": 4, "Service": "ListZones"}) + "\n").encode()
-            )
-            response = sock.recv(4096).decode("utf-8").replace("\x00", "").strip()
-
-        devices = []
-        response_json = json.loads(response)
-        for zone in response_json["ZoneList"]:
-            zone_id = zone.get("ZID")
-            zone_name = zone.get("Name", f"Zone {zone_id}")
-            if zone_id:
-                devices.append(
-                    {
-                        "zone_id": zone_id,
-                        "name": zone_name.replace(" ", "_"),
-                        "sources": sources["SourceList"],
-                    }
-                )
-
-        if not devices:
-            raise RuntimeError("No zones found")
-        return devices
